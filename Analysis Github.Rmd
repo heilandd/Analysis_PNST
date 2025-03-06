@@ -1,0 +1,3021 @@
+---
+title: "Analysis Script"
+author: "Dieter Henrik Heiland"
+date: "2025-03-06"
+output: pdf_document
+---
+
+# Preprocessing
+## Load packages and Functions:
+
+For the analysis, a python environment (here calles c2l) is required for the analysis. The environment should contain "cell2location"
+```{r}
+reticulate::use_condaenv("c2l")
+
+library(SPATA2)
+library(Seurat)
+library(tidyverse)
+library(EBImage)
+library(jsonlite)
+
+## Functions
+prepareWGCNA <- function(list.obj, feature){
+  
+  # Summarize counts
+  
+  s_list <- map(.x=1:length(list.obj), .f=function(i){
+    
+    message(paste0("Process Object: ", i))
+    feat <- 
+      joinWithFeatures(list.obj[[i]], features = feature) %>% 
+      dplyr::select(barcodes,{{feature}} ) %>% 
+      left_join(., getCountMatrix(list.obj[[i]]) %>% as.data.frame() %>% t() %>% as.data.frame()  %>% rownames_to_column("barcodes"), by="barcodes") 
+    
+    feat$barcodes <- NULL
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature)) %>% 
+      summarise_all(.fun=sum)
+    
+    feat.mat <- feat[2:ncol(feat)] %>% as.matrix() %>% t()
+    colnames(feat.mat) <- paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+    obj <- Seurat::CreateSeuratObject(feat.mat)
+    
+    return(obj)
+    
+  })
+  
+  
+  seurat <- s_list[[1]];for(i in 2:length(s_list)){seurat <- merge(seurat, s_list[[i]])}
+  seurat <- 
+    seurat %>%
+    NormalizeData() %>%
+    FindVariableFeatures() %>%
+    ScaleData() %>% 
+    SCTransform(return.only.var.genes = F)
+  
+  return(seurat)
+  
+}
+
+```
+## Create meta data file
+```{r}
+
+root = "/path/to/your/data/"
+
+samples <- 
+data.frame(samples=c("AA_150578", "AA_122993", "AA_147919", "AA_148261", "AA_149676", "AA_125161", "AA_X1", "AA_X2"),
+           Diagnosis=c("HPNST", "MPNST","MPNST", "HPNST", "MPNST", "MPNST", "Neurofibrom", "Neurofibrom"),
+           path=paste0(root,paste0("Aachen", 1:8,".RDS")),
+           outs_folder=c(paste0(root, 1:4, "/outs"),
+                         paste0(root,1:4, "/outs")),
+           old_obj=c(paste0(root, "AA_1_", 1:4),
+                    paste0(root, "AA_2_", 1:4)))
+
+
+## Add published Data
+new_data = ("~/.../PublishedData")
+folder_new <- paste0(dir(new_data, pattern="NF", full.names = T), "/outs")
+for(i in 1:4){
+  
+  image = EBImage::readImage(paste0(folder_new[i], "/spatial/tissue_hires_image.png"))
+  plot(image)
+  image <- EBImage::rotate(image, 270)
+  plot(image)
+  counts <- Seurat::Read10X(paste0(folder_new[i], "/filtered_feature_bc_matrix"))
+  coords = read.csv(paste0(folder_new[i], "/spatial/tissue_positions_list.csv"), header = F)
+  names(coords) <- c("barcodes","tissue", "row", "col", "x", "y")
+  
+  ## Scale coords:
+  json_data <- fromJSON(paste0(folder_new[i], "/spatial/scalefactors_json.json"))
+  
+  bc <- intersect(colnames(counts) , coords$barcodes)
+  counts <- counts[,colnames(counts) %in% bc]
+  coords <- coords %>% filter(barcodes %in% bc)
+
+  coords[,c("x","y")] <- coords[,c("x","y")]*json_data$tissue_hires_scalef
+  
+  
+  object = SPATA2::initiateSpataObject_CountMtr(counts,
+                                                image =  image,
+                                                coords_df = coords,
+                                                sample_name = dir(new_data)[i],
+                                                spatial_method="Visium")
+  
+  #object <- SPATA2::flipCoordinates(object, axis="v")
+  plotSurface(object,pt_alpha=0.8, display_image=T)
+
+  saveRDS(object,paste0(root, "/Data_Eingezeichnet/",paste0("AachenNeu", i,".RDS")))
+  
+  }
+
+```
+
+## Data Normalisation with scVI
+## Get scVI normalisation
+```{python}
+def RunscVI(adata):
+  import scanpy as sc
+  import scvi
+  scvi.model.SCVI.setup_anndata(adata)
+  model = scvi.model.SCVI(adata, n_latent=10)
+  model.train(accelerator='cpu', max_epochs=20, early_stopping=True)
+  scVI_norm = model.get_normalized_expression()
+  return(scVI_norm)
+
+```
+```{r}
+
+scVI_expression <- function(object,epoch=20){
+  library(reticulate)
+   message("SPATA2AnnData")
+  ## Transfer SPATA2 objects to anndata
+  library(SingleCellExperiment)
+  sc <- reticulate::import("scanpy")
+  np <- reticulate::import("numpy")
+  pd <- reticulate::import("pandas")
+  bc <- getBarcodes(object)
+  sce <- 
+    Seurat::CreateSeuratObject(counts=SPATA2::getCountMatrix(object)) %>% 
+    Seurat::as.SingleCellExperiment()
+  exprs <- assay(sce, "counts")
+  col_data <- as.data.frame(colData(sce))
+  row_data <- as.data.frame(rowData(sce))
+
+  adata = sc$AnnData(X = t(exprs),obs = col_data, var = row_data)
+  adata$obsm[["spatial"]] <- getCoordsDf(object)[,c("x", "y")] %>% as.matrix()
+  
+  adata$obsm[["pca"]] <- 
+    SPATA2::getPcaDf(object) %>% 
+    filter(barcodes %in% bc) %>% 
+    select(-barcodes, -sample) %>% 
+    as.matrix()
+
+  message("Run scVI")
+  scVI_norm <- py$RunscVI(adata)
+  
+  norm_expression = scVI_norm %>% t()
+  object <- SPATA2::addExpressionMatrix(object, mtr_name = "scVI", expr_mtr =  norm_expression)
+  return(object)
+  
+}
+
+```
+
+# Add Histology to the SPATAobjects
+```{r}
+
+i=4
+obj <- readRDS(new_samples$path[i])
+#obj <- SPATA2::createSegmentation(obj)
+
+obj@fdata[[1]] <- obj@fdata[[1]] %>% mutate(Histology = as.character(obj@fdata[[1]]$histology))
+obj@fdata[[1]]$Histology[is.na(obj@fdata[[1]]$Histology)]="Stroma"
+
+obj <- SPATA2::identifyTissueSections(obj)
+obj <- SPATA2::identifyTissueOutline(obj)
+
+plotSurface(obj,color_by="Histology",pt_alpha=0.8, display_image=F)+
+  #SPATA2::ggpLayerAxesSI(obj)+
+  SPATA2::ggpLayerThemeCoords()
+
+
+saveRDS(obj, new_samples$path[i])
+
+```
+
+# Create Merged Seurat Object
+```{r}
+samples <- all_data
+# Add features to Seurat object
+seurat.list=map(.x=1:8, .f=function(i){
+  
+  message(paste0("Process Object: ", i))
+  
+  new <- readRDS(samples$path[i])
+  features <- getFeatureDf(new) %>% as.data.frame() %>% dplyr::select(sample, Histologie, BayesSpace, SNN_corr)
+  rownames(features) <- getFeatureDf(new)$barcodes
+  
+  #2. Export Seurat Object
+  seurat_obj <- Seurat::CreateSeuratObject(getCountMatrix(new))
+  seurat_obj@meta.data <- cbind(seurat_obj@meta.data , features)
+  
+  return(seurat_obj)
+})
+
+# Merge all Seurat object into one object and run normalisation 
+seurat_all <- seurat.list[[1]];for(i in 2:8){seurat_all <- merge(seurat_all, seurat.list[[i]])}
+seurat_all <- SetIdent(seurat_all, value = "sample")
+
+# Run horizontal integration by MNN (Mutual Neares Neighbor)
+seurat_all <- Seurat::DietSeurat(seurat_all)
+seurat_all <- SeuratWrappers::RunFastMNN(SplitObject(seurat_all, split.by = "sample"))
+
+seurat_all <- 
+  seurat_all %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunUMAP(reduction="mnn", dims=1:20)
+
+seurat_all@meta.data$Diagnosis <- 
+seurat_all@meta.data %>% as.data.frame() %>% left_join(., data.frame(sample=paste0("Aachen", 1:8),
+                                                                     Diagnosis=samples$Diagnosis), by="sample") %>% pull(Diagnosis)
+
+
+dat.plot <- DimPlot(seurat_all, group.by = c("Diagnosis"))
+plotdf <- cbind(seurat_all@meta.data %>% as.data.frame() %>% dplyr::select(Diagnosis,Histologie,sample), 
+                dat.plot$data %>% dplyr::select(UMAP_1,UMAP_2))
+
+ggplot(data=plotdf, aes(x=UMAP_1, y=UMAP_2, color=Diagnosis))+
+  theme_void()+
+  geom_point(size=1, alpha=0.5)+
+  scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(3, "Set2"))(3))+
+  coord_fixed()
+
+saveRDS(seurat_all, "seurat_all.RDS")
+
+```
+
+# Analysis All Data
+```{r}
+
+seurat.list=map(.x=1:8, .f=function(i){
+  
+  
+  
+  message(paste0("Process Object: ", i))
+  
+  new <- readRDS(samples$path[i])
+  old <- readRDS(samples$old_obj[i])
+  
+  ns <- getSampleNames(new)
+  os <- getSampleNames(old)
+  
+  #Transfer Matrix
+  new@data[[ns]]$SCE <-   old@data[[os]]$SCE
+  new@data[[ns]]$denoised <- old@data[[os]]$denoised
+  
+  # Transfer Features
+  feature_df <- getFeatureDf(old) %>%  left_join(., getFeatureDf(new) %>% dplyr::select(barcodes, Histologie), by="barcodes" )
+  new <- setFeatureDf(new, feature_df)
+  new <- setActiveExpressionMatrix(new, "denoised")
+  
+  #Transfer CNV
+  new@cnv <- old@cnv
+  names(new@cnv) <- ns
+  
+  saveRDS(new, samples$path[i])
+  
+  #2. Export Seurat Object
+  seurat_obj <- Seurat::CreateSeuratObject(getCountMatrix(new))
+  return(seurat_obj)
+})
+
+# Add features to Seurat object (new)
+seurat.list=map(.x=1:8, .f=function(i){
+
+  message(paste0("Process Object: ", i))
+  
+  new <- readRDS(samples$path[i])
+  features <- getFeatureDf(new) %>% as.data.frame() %>% dplyr::select(sample, Histologie, BayesSpace, SNN_corr)
+  rownames(features) <- getFeatureDf(new)$barcodes
+  
+  #2. Export Seurat Object
+  seurat_obj <- Seurat::CreateSeuratObject(getCountMatrix(new))
+  seurat_obj@meta.data <- cbind(seurat_obj@meta.data , features)
+  
+  return(seurat_obj)
+})
+
+
+# Merge all Seurat object into one object and run normalisation 
+seurat_all <- seurat.list[[1]];for(i in 2:8){seurat_all <- merge(seurat_all, seurat.list[[i]])}
+seurat_all <- SetIdent(seurat_all, value = "sample")
+
+
+# Run horizontal integration by MNN (Mutual Neares Neighbor)
+seurat_all <- Seurat::DietSeurat(seurat_all)
+seurat_all <- SeuratWrappers::RunFastMNN(SplitObject(seurat_all, split.by = "sample"))
+
+
+seurat_all <- 
+  seurat_all %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunUMAP(reduction="mnn", dims=1:20)
+
+
+seurat_all@meta.data$Diagnosis <- 
+seurat_all@meta.data %>% as.data.frame() %>% 
+  left_join(., data.frame(sample=paste0("Aachen", 1:8),
+                          Diagnosis=samples$Diagnosis), by="sample") %>% pull(Diagnosis)
+
+
+dat.plot <- DimPlot(seurat_all, group.by = c("Diagnosis"))
+plotdf <- cbind(seurat_all@meta.data %>% as.data.frame() %>% dplyr::select(Diagnosis,Histologie,sample), 
+                dat.plot$data %>% dplyr::select(UMAP_1,UMAP_2))
+
+ggplot(data=plotdf, aes(x=UMAP_1, y=UMAP_2, color=Diagnosis))+
+  theme_void()+
+  geom_point(size=1, alpha=0.5)+
+  scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(3, "Set2"))(3))+
+  coord_fixed()
+
+saveRDS(seurat_all, "seurat_all.RDS")
+
+```
+
+
+# Analysis MPNST 
+## Preprocessing
+```{r}
+
+#Load sample list
+samples <- readRDS("~/.../samples.RDS")
+samples <- samples %>% filter(Diagnosis=="MPNST")
+seurat_all <- readRDS("~/.../seurat_all.RDS")
+
+
+seurat_MPNST <- subset(seurat_all, cells=seurat_all@meta.data %>% as.data.frame() %>% filter(Diagnosis=="MPNST") %>% rownames())
+seurat_MPNST <- Seurat::DietSeurat(seurat_MPNST)
+seurat_MPNST <- SeuratWrappers::RunFastMNN(SplitObject(seurat_MPNST, split.by = "sample"))
+
+seurat_MPNST <- 
+  seurat_MPNST %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunUMAP(reduction="mnn", dims=1:20)
+
+dat.plot <- DimPlot(seurat_MPNST, group.by = c("Histologie"), label = T, raster = T)
+plotdf <- cbind(seurat_MPNST@meta.data %>% as.data.frame() %>% dplyr::select(Diagnosis,Histologie,sample), 
+                dat.plot$data %>% dplyr::select(UMAP_1,UMAP_2))
+
+ggplot(data=plotdf, aes(x=UMAP_1, y=UMAP_2, color=Histologie))+
+  theme_void()+
+  geom_point(size=1, alpha=0.5)+
+  #dat.plot[[1]]$layers[[1]]+
+  #dat.plot$layers[[2]]+
+  scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(9, "Set1"))(11))+
+  coord_fixed()
+
+
+
+
+#1. Merge Count matrix of each cluster 
+
+list.obj <- map(.x=1:nrow(samples), .f=~readRDS(samples$path[.x]))
+feature <- "BayesSpace"
+
+list.obj[[1]] %>% SPATA2::plotSurfaceInteractive()
+
+
+prepareWGCNA <- function(list.obj, feature){
+  
+  # Summarize counts
+  
+  s_list <- map(.x=1:length(list.obj), .f=function(i){
+    
+    message(paste0("Process Object: ", i))
+  feat <- 
+    joinWithFeatures(list.obj[[i]], features = feature) %>% 
+    select(barcodes,{{feature}} ) %>% 
+    left_join(., getCountMatrix(list.obj[[i]]) %>% as.data.frame() %>% t() %>% as.data.frame()  %>% rownames_to_column("barcodes"), by="barcodes") 
+  
+  feat$barcodes <- NULL
+  
+  feat <- 
+    feat %>% 
+    group_by(!!sym(feature)) %>% 
+    summarise_all(.fun=sum)
+  
+  feat.mat <- feat[2:ncol(feat)] %>% as.matrix() %>% t()
+  colnames(feat.mat) <- paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+  obj <- Seurat::CreateSeuratObject(feat.mat)
+  
+  return(obj)
+    
+  })
+
+
+seurat <- s_list[[1]];for(i in 2:length(s_list)){seurat <- merge(seurat, s_list[[i]])}
+seurat <- 
+  seurat %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  SCTransform(return.only.var.genes = F)
+  
+return(seurat)
+  
+}
+comb <- prepareWGCNA(list.obj, "BayesSpace")
+
+library(WGCNA)
+
+seurat_obj <- 
+  hdWGCNA::SetupForWGCNA(comb, gene_select = "fraction",fraction = 0.05,wgcna_name = "vis") %>% 
+  hdWGCNA::SetDatExpr(assay="RNA")
+seurat_obj %>%  hdWGCNA::PlotDendrogram()
+
+## Add Histology 
+getTraits <- function(list.obj, feature, Traits){
+  
+  
+  class <- list.obj[[1]] %>% joinWithFeatures(features=Traits) %>% pull(!!sym(Traits)) %>% class()
+  
+  if(class=="factor"){
+    # Summarize counts
+    # For characters
+    s_list <- map(.x=1:length(list.obj), .f=function(i){
+      
+      message(paste0("Process Object: ", i))
+      feat <- 
+        joinWithFeatures(list.obj[[i]], features = c(feature,Traits)) %>% 
+        dplyr::select(barcodes,{{feature}}, {{Traits}} )
+      
+      feat <- 
+        feat %>% 
+        group_by(!!sym(feature), !!sym(Traits)) %>% 
+        summarize(n=n()) %>%
+        mutate(freq = n / sum(n)) %>% 
+        pivot_wider(names_from = !!sym(Traits), values_from = freq)
+      feat[is.na(feat)]=0
+      
+      feat <- 
+        feat %>% 
+        group_by(!!sym(feature)) %>% summarise_all(.funs = sum) %>% 
+        as.data.frame()
+      
+      feat[,feature] <-  paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+      return(feat)
+      
+    })
+    names.traits <- map(s_list, .f=~names(.x)[-c(1:2)]) %>% unlist() %>% unique()
+    samples <- map(s_list, .f=~.x[,feature]) %>% unlist()
+    mat <- matrix(0, nrow=length(samples), ncol=length(names.traits))
+    colnames(mat) <- names.traits; rownames(mat) <- samples
+    for(i in 1:length(s_list)){
+      traits <- names(s_list[[i]])[-c(1:2)]
+      m <- s_list[[i]][,traits] %>% as.matrix()
+      rownames(m) <- s_list[[i]][,feature]
+      mat[rownames(m), traits] <- m
+    }
+  }else{
+    if(class=="numeric"){
+      s_list <- map_dfr(.x=1:length(list.obj), .f=function(i){
+        
+        message(paste0("Process Object: ", i))
+        feat <- 
+          joinWithFeatures(list.obj[[i]], features = c(feature,Traits)) %>% 
+          dplyr::select(barcodes,{{feature}}, {{Traits}} )
+        feat <- 
+          feat %>% 
+          group_by(!!sym(feature)) %>% 
+          summarise(mean=mean(!!sym(Traits)))
+        feat[is.na(feat)]=0
+        feat[,feature] <-  paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+        return(feat)
+        
+      })
+      mat <- s_list %>% as.data.frame()
+      rownames(mat) <- mat$BayesSpace
+      mat$BayesSpace=NULL
+      names(mat) <- Traits
+    }
+  }
+  
+  
+  #For numeric
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  return(mat)
+  
+}
+cell_types <- c(list.obj[[1]] %>% getFeatureNames() %>% as.character())[11:24]
+
+#Character
+Traits.mat <- getTraits(list.obj, feature="BayesSpace", Traits="Histologie")
+
+#numeric
+Traits.mat.num <- map_dfc(cell_types, ~getTraits(list.obj, feature="BayesSpace", Traits=.x))
+
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, Traits.mat[seurat_obj@meta.data %>% rownames(), ], Traits.mat.num[seurat_obj@meta.data %>% rownames(), ])
+cur_traits <- c(names(Traits.mat.num), colnames(Traits.mat))
+
+
+
+## Compare Niches
+
+merge <- comb@assays$SCT@scale.data %>% cor()
+samples$ID <- c("Aachen2", "Aachen3", "Aachen5", "Aachen6")
+anno.row <- cbind(seurat_obj@meta.data[6:16])
+
+bar.df <- 
+  seurat_obj@meta.data[,28:41] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("Niches") %>% 
+  pivot_longer(., cols=all_of(cell_types)) %>% 
+  group_by(Niches) %>% 
+  summarise(sum=sum(value),value=value,cell_types=cell_types) %>% 
+  group_by(Niches, cell_types) %>%
+  summarise(freq=value/sum)
+
+
+plot <- pheatmap::pheatmap(merge, annotation_col = anno.row,  color = RColorBrewer::brewer.pal(9,"RdPu"))
+
+## Get Cell type colors
+cell_colors <- 
+data.frame(annotation_level1=c("Lymphoid","Lymphoid","Lymphoid","Myeloid","Stroma","Endothelial","Myeloid","Myeloid","Lymphoid","Malignant","Schwanncells","Endothelial","Malignant","Stroma"), 
+           annotation_level2=cell_types)
+
+cell_colors <- SPATAwrappers::getSubColors(cell_colors, "annotation_level1", "annotation_level2", max_pal=6)
+
+anno4 <- cell_colors$colors
+names(anno4) <- cell_colors$annotation_level2
+
+
+bar.df$Niches <- factor(bar.df$Niches, levels = plot$tree_col$labels)
+bar.df$cell_types <- factor(bar.df$cell_types, levels = cell_colors$annotation_level2)
+ggplot(bar.df)+
+  geom_col(mapping=aes(x=Niches, y=freq, fill=cell_types))+
+  scale_fill_manual(values=anno4)+
+  theme_classic()
+
+
+seurat_obj@meta.data$Diagnosis <- anno.row$Diagnosis
+seurat_obj@meta.data$Neurofibrom[1:12] <- seurat_obj@meta.data$Neurofibroma[1:12]
+seurat_obj@meta.data$Neurofibroma <- NULL
+
+
+## Plot some cell type plots
+
+list.obj[[1]] %>% SPATA2::plotSurfaceInteractive()
+source("~/.../SPATA_plot_extensions.R")
+col=colorRampPalette(RColorBrewer::brewer.pal(9, "Blues") )
+pram="CDK4"
+p <- plotSurface(list.obj[[4]] , color_by = pram, display_image = F, alpha_by = pram)
+add_hull(list.obj[[4]],p,pt.b = 7)+
+  scale_colour_gradientn(colours = col(50), 
+                         limits= c(0.4,0.8),
+                         oob = scales::squish, na.value = "white")+
+  coord_fixed()
+
+pram="malignant"
+col=colorRampPalette(RColorBrewer::brewer.pal(9, "Greys") )
+p <- plotSurface(list.obj[[4]] , color_by = pram, display_image = F, alpha_by = pram)
+add_hull(list.obj[[4]],p,pt.b = 7)+
+  scale_colour_gradientn(colours = col(50), 
+                         limits= c(0.6,0.8),
+                         oob = scales::squish, na.value = "white")+
+  coord_fixed()
+
+
+joinWith(list.obj[[4]], features = c("Prof_Tumor", "malignant"), genes = "CDK4") %>% select(all_of(c("Prof_Tumor", "malignant", "CDK4")))
+
+cor <- runSpatialCorrelation(list.obj[[1]], features = c("Prof_Tumor", "malignant", "CDK4", "TOP2A", "Schwanncells", "Macrophages"))
+cor <- runSpatialCorrelation(list.obj[[1]], features = cell_types)
+
+corrplot::corrplot(cor[names(anno4),names(anno4)], is.corr = T, col=colorRampPalette(RColorBrewer::brewer.pal(9, "PRGn"))(50))
+
+
+
+Stem_sig <- readxl::read_excel("~/Desktop/Aachen_NP/CellSignatures/sciadv.abo5442_data_s2.xlsx")
+
+Stem_sig <- Stem_sig[, c(2,6,7)] %>% as.data.frame()
+
+SCP_like <- Stem_sig$`Neoplastic SC: SCP-like`
+SCP_like <- SCP_like[!is.na(SCP_like)]
+
+NC_like <- Stem_sig$`Malignant NC-like`
+NC_like <- NC_like[!is.na(NC_like)]
+
+NC_MES_like <- Stem_sig$`Malignant NC-MES`
+NC_MES_like <- NC_MES_like[!is.na(NC_MES_like)]
+
+gs <- 
+  rbind(data.frame(ont="SCP_like", gene=SCP_like),
+      data.frame(ont="NC_like", gene=NC_like),
+      data.frame(ont="NC_MES_like", gene=NC_MES_like))
+
+
+i=2
+
+
+list.obj[[i]]@used_genesets <- rbind(list.obj[[i]]@used_genesets, gs)
+
+
+pram="SCP_like"
+col=colorRampPalette(RColorBrewer::brewer.pal(9, "Greens") )
+p <- plotSurface(list.obj[[i]] , color_by = pram, display_image = F)
+add_hull(list.obj[[i]],p,pt.b = 7)+
+  scale_colour_gradientn(colours = col(50), 
+                         limits= c(0.6,0.8),
+                         oob = scales::squish, na.value = "white")+
+  coord_fixed()
+
+pram="NC_like"
+
+p <- plotSurface(list.obj[[i]] , color_by = pram, display_image = F)
+add_hull(list.obj[[i]],p,pt.b = 7)+
+  scale_colour_gradientn(colours = col(50), 
+                         limits= c(0.6,0.8),
+                         oob = scales::squish, na.value = "white")+
+  coord_fixed()
+
+pram="NC_MES_like"
+
+p <- plotSurface(list.obj[[i]] , color_by = pram, display_image = F)
+add_hull(list.obj[[i]],p,pt.b = 7)+
+  scale_colour_gradientn(colours = col(50), 
+                         limits= c(0.6,0.8),
+                         oob = scales::squish, na.value = "white")+
+  coord_fixed()
+
+
+plotSurface(list.obj[[i]] , color_by = pram, pt_alpha = 0, display_image = T)
+
+
+
+cor <- map(1:4, ~runSpatialCorrelation(list.obj[[.x]], features = c("CDK4", "TOP2A", "SCP_like", 
+                                                         "B_cell", "CD4", "CD8", "DC","Macrophages", "Fibroblast", "Vascular", "pericytes", "NC_like", "NC_MES_like")))
+
+cor.mat <- Reduce(`+`, cor) / 4
+
+library(ggcorrplot)
+ggcorrplot(cor.mat[c("B_cell", "CD4", "CD8", "DC","Macrophages", "Fibroblast", "Vascular", "pericytes"),
+                   c("NC_like", "SCP_like", "NC_MES_like")] %>% as.data.frame(), 
+           method = "circle", 
+           outline.color = "black", 
+           lab_size=1,
+           insig="pch")+
+  scale_fill_gradientn(colours = colorRampPalette(RColorBrewer::brewer.pal(9, "Blues"))(50), name="")+
+  guides(fill = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  ggtitle("Module correlation to treatment condition")+
+  xlab("")+ylab("")+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=1),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+
+```
+
+## WGCNA
+```{r}
+# WGCNA MPNST -------------------------------------------------------------
+
+
+
+corrplot::corrplot(cor[c("CDK4", "TOP2A", "Macrophages", "CD8"), c( "SCP_like","NC_like", "NC_MES_like")], is.corr = T, col=colorRampPalette(RColorBrewer::brewer.pal(9, "PRGn"))(50))
+
+plotCnvHeatmap(list.obj[[1]])
+
+pram="Chr22q"
+#col=colorRampPalette(RColorBrewer::brewer.pal(9, "Greys") )
+p <- plotSurface(list.obj[[1]] , color_by = pram, display_image = F)
+add_hull(list.obj[[1]],p,pt.b = 7)+
+  scale_colour_gradientn(colours = col(50), 
+                         #limits= c(0.6,0.8),
+                         oob = scales::squish, na.value = "white")+
+  coord_fixed()
+
+
+# Correct histology
+
+list.obj[[2]]@fdata$Aachen3$Histologie <- as.character(list.obj[[2]]@fdata$Aachen3$Histologie) 
+list.obj[[2]]@fdata$Aachen3$Histologie[is.na(list.obj[[2]]@fdata$Aachen3$Histologie)] <- "MPNST"
+list.obj[[2]]@fdata$Aachen3$Histologie <- as.factor(list.obj[[2]]@fdata$Aachen3$Histologie)
+
+list.obj[[3]]@fdata$Aachen5$Histologie <- as.character(list.obj[[3]]@fdata$Aachen5$Histologie) 
+list.obj[[3]]@fdata$Aachen5$Histologie[list.obj[[3]]@fdata$Aachen5$Histologie=="unnamed"] <- "MPNST"
+list.obj[[3]]@fdata$Aachen5$Histologie <- as.factor(list.obj[[3]]@fdata$Aachen5$Histologie)
+
+
+for( i in 1:4){list.obj[[i]] <- list.obj[[i]] %>% SPATA2::updateSpataObject()}
+
+
+
+## create colors for histology
+cols_hist <- RColorBrewer::brewer.pal(length(names(anno.row)),"Set3")
+names(cols_hist) <- names(anno.row)
+
+plotSurface(list.obj[[1]], color_by = "Histologie")
+plotSurface(list.obj[[2]], color_by = "Histologie")
+plotSurface(list.obj[[3]], color_by = "Histologie")
+plotSurface(list.obj[[4]], color_by = "Histologie", display_image = F) + 
+  SPATA2::ggpLayerAxesSI(list.obj[[4]])+
+  scale_color_manual(values=cols_hist)
+
+
+feature_plot(obj=list.obj[[4]], feature="BayesSpace", size_bg=6, size_bg.diff=1)+
+  scale_color_manual(values=RColorBrewer::brewer.pal(6,"RdPu"))
+
+feature_plot(obj=list.obj[[4]], feature="Histologie", size_bg=6, size_bg.diff=1)+
+  scale_color_manual(values=cols_hist)
+
+expression_plot(list.obj[[4]], gene="TOP2A",size_bg=6, size_bg.diff=1, 
+                limits = c(0.6, 0.8))+
+  scale_colour_gradientn(colours = RColorBrewer::brewer.pal(9,"Reds"),
+                         limits = c(0.5, 1), 
+                         oob=scales::squish)
+  
+
+
+feature_plot <- function(obj, feature, hull.plot="points", size_bg=4, size_bg.diff=0.5){
+  
+  if(hull.plot=="points"){
+    
+    plotDF <- SPATA2::plotSurface(obj, color_by = feature, display_image = F)
+    
+    p1 <- 
+      ggplot(plotDF$data)+
+      #Background
+      geom_point(plotDF$data, mapping = aes(x,y), color="black", size=size_bg)+
+      geom_point(plotDF$data, mapping = aes(x,y), color="white", size=size_bg-size_bg.diff)+
+      plotDF$layers[[1]]+
+      coord_fixed()+
+      SPATA2::ggpLayerAxesSI(obj)+
+      ggtitle(feature)
+    
+      
+    
+        
+    
+  }else{
+    hull <-   
+      getCoordsDf(obj) %>% 
+      ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+    
+    
+    
+    p1 <- SPATA2::plotSurface(obj, 
+                              color_by = feature, 
+                              display_image = F)+
+      hull+
+      SPATA2::ggpLayerAxesSI(obj)+
+      ggtitle(feature)
+  }
+  
+  
+  
+  return(p1)
+}
+expression_plot <- function(obj, gene, col="Reds",limits, hull.add=T,
+                            hull.plot="points", size_bg=4, size_bg.diff=0.5){
+  #obj <- SPATA2::updateSpataObject(obj)
+  
+  if(hull.plot=="points"){
+    
+    df <- SPATA2::joinWith(obj, genes=gene, normalize = T, smooth = F)
+    names(df)[7] <- "gene"
+    
+    obj@information$active_mtr <- "denoised"
+    
+    plotDF <- SPATA2::plotSurface2(df, 
+                                   color_by = "gene", 
+                                   alpha_by = "gene",
+                                   pt_clrsp=col,
+                                   limits=limits,
+                                   oob=scales::squish)
+    
+    p1 <- 
+      ggplot(plotDF$data)+
+      #Background
+      geom_point(plotDF$data, mapping = aes(x,y), color="black", size=size_bg)+
+      geom_point(plotDF$data, mapping = aes(x,y), color="white", size=size_bg-size_bg.diff)+
+      plotDF$layers[[1]]+
+      coord_fixed()+
+      SPATA2::ggpLayerAxesSI(obj)+
+      ggtitle(gene)
+    
+    
+    
+    
+  }
+  else{
+    
+    hull <-   
+      getCoordsDf(obj) %>% 
+      ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+    
+    df <- SPATA2::joinWith(obj, genes=gene, normalize = T, smooth = F)
+    names(df)[7] <- "gene"
+    
+    obj@information$active_mtr <- "denoised"
+    p1 <- SPATA2::plotSurface2(df, 
+                               color_by = "gene", 
+                               alpha_by = "gene",
+                               pt_clrsp=col,
+                               limits=limits,
+                               oob=scales::squish)+
+      SPATA2::ggpLayerAxesSI(obj)+
+      ggtitle(gene)
+    
+    if(hull.add==T){p1 <- p1+hull}
+    
+  }
+  
+  return(p1)
+}
+
+
+
+
+
+
+SPATA2::plotCnvHeatmap(list.obj[[3]], across = "Histologie")
+
+
+
+#Check Network Con
+wrap_plots(hdWGCNA::PlotSoftPowers(seurat_obj), ncol=2)
+
+#Get Network
+seurat_obj <- hdWGCNA::ConstructNetwork(seurat_obj,soft_power=6,tom_name='test',overwrite_tom=TRUE)
+
+# plot the dendrogram
+hdWGCNA::PlotDendrogram(seurat_obj, main='WGCNA dendrogram')
+seurat_obj <- hdWGCNA::ModuleEigengenes(seurat_obj, assay = "RNA",npcs = 30)
+seurat_obj <- hdWGCNA::ModuleConnectivity(seurat_obj)
+library(hdWGCNA)
+library(igraph)
+
+HubGeneNetworkPlot(seurat_obj,n_hubs = 10, n_other=20, edge_prop = 0.25,mods = 'all', vertex.label=NA)
+
+
+seurat_obj <- RunModuleUMAP(
+  seurat_obj,
+  n_hubs = 5,
+  n_neighbors=5,
+  min_dist=0.1,
+  spread=2,
+  wgcna_name = 'vis',
+  target_weight=0.05,
+  supervised=TRUE
+)
+
+p=ModuleUMAPPlot(
+  seurat_obj,
+  edge.alpha=0.25,
+  sample_edges=TRUE,
+  edge_prop=0.2, 
+  label_hubs=2,
+  return_graph=T,
+  keep_grey_edges=FALSE)
+
+
+plotdf <- seurat_obj@misc$vis$module_umap %>% filter(color!="grey60")
+plotdf2 <- as_long_data_frame(p)
+plotdf2 <- plotdf2 %>% filter(from_name %in% plotdf$gene)
+plot <- ggplot()+theme_classic()+coord_fixed()
+plot <- plot+geom_segment(data=plotdf2, mapping = aes(x=from_UMAP1, y=from_UMAP2, xend=to_UMAP1, yend=to_UMAP2), size=plotdf2$from_kME*0.1, alpha=plotdf2$from_kME*0.5)
+plot <- plot+geom_point(data=plotdf, mapping=aes(x=UMAP1, y=UMAP2),size=plotdf$kME*2, alpha=0.3, color=gplots::col2hex(plotdf$color))
+plot
+
+
+seurat_obj@misc$vis$MEs
+
+
+kME <- seurat_obj@misc$vis$wgcna_modules 
+vec <- names(kME) %>% str_detect(., "kME")
+kME <- kME[,vec]
+
+dim(kME)
+
+
+gcSample <- map(.x=unique(kME$color), .f=function(i){
+
+  kME %>% filter(color==i) %>% arrange(desc(!!sym(paste0("kME_",i)))) %>% head(300) %>% rownames()
+
+  
+})
+names(gcSample) <- unique(kME$color)
+gcSample <- gcSample[which(c(map(gcSample, .f=~length(.x)) %>% unlist())>50)]
+
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+xx <- compareCluster(gcSample, 
+                     fun="enrichGO",
+                     ont ="BP", 
+                     keyType = "SYMBOL", 
+                     OrgDb = "org.Hs.eg.db")
+
+library(DOSE)
+library(enrichplot)
+edo <- pairwise_termsim(xx)
+
+plot <- emapplot(edo, showCategory=50, cex_category=0.01, pie="Count", cex_line = 0.3, layout="graphopt", min_edge=0.15, repel=T)
+plot
+
+dotplot(edo, showCategory=3)+theme_classic()+scale_colour_gradientn(colors ="black")
+
+
+
+res_map <- 
+  edo@compareClusterResult %>% 
+  filter(Description %in% plot$data$name) %>% 
+  group_by(Description, Cluster) %>% 
+  summarise(p = mean(p.adjust)) %>% 
+  ungroup() 
+
+anno <- data.frame(name=unique(res_map$Description), type=map(.x=unique(res_map$Description), .f=function(i){
+  
+  
+  c <- res_map %>% filter(Description==i) %>% pull(Cluster)
+  return(c[res_map %>% filter(Description==i) %>% pull(p) %>% which.min()] %>% as.character())
+}) %>% unlist())
+anno$type <- factor(anno$type, levels =names(gcSample) )
+plot$data <- plot$data %>% dplyr::left_join(., anno, by="name")
+
+col.test <- gplots::col2hex(unique(plot$data$type))
+names(col.test) <- unique(plot$data$type)
+
+ggplot(data=plot$data)+
+  plot$layers[[1]]+
+  geom_point(mapping = aes(x=x, y=y, size=size, color=type))+ # %>% scales::muted()+
+  theme_classic()+
+  scale_color_manual(values = col.test)
+  
+
+### Get Traits to WGCNA Analysis
+
+list.obj <- map(list.obj, .f=function(.x){
+  ## Add cell type as Traits
+  .x@used_genesets <- rbind(.x@used_genesets, gs)
+  
+  df <- .x %>% joinWithGeneSets(., gene_sets = gs$ont %>% unique()) %>% 
+    dplyr::select(barcodes,SCP_like, NC_like, NC_MES_like)
+  
+  names(df)[2:4] <- paste0("Feat_", gs$ont %>% unique())
+  
+  .x <- addFeatures(.x, df)
+  
+  return(.x)
+  
+})
+
+list.obj <- map(list.obj, .f=function(.x){
+  ## Add cell type as Traits
+  df <- .x %>% 
+    joinWith(., gene_sets = c(gs$ont %>% unique()), features="malignant", normalize = T) %>% 
+    dplyr::select(barcodes,SCP_like, NC_like, NC_MES_like, malignant)
+  
+  df$malignant_spot=F
+  df[df$malignant>1, ]$malignant_spot=T
+  
+  df$subtype="non"
+  df[df$malignant_spot==T, ]$subtype <- map(which(df$malignant_spot==T), ~names(df)[2:4][which.max(df[.x,2:4]) ] ) %>% unlist()
+  
+  
+  .x <- addFeatures(.x, df[, c(1,7)])
+  
+  return(.x)
+  
+})
+
+list.obj[[1]]@fdata[[1]]$subtype <- as.factor(list.obj[[1]]@fdata[[1]]$subtype)
+list.obj[[2]]@fdata[[1]]$subtype <- as.factor(list.obj[[2]]@fdata[[1]]$subtype)
+list.obj[[3]]@fdata[[1]]$subtype <- as.factor(list.obj[[3]]@fdata[[1]]$subtype)
+list.obj[[4]]@fdata[[1]]$subtype <- as.factor(list.obj[[4]]@fdata[[1]]$subtype)
+
+getTraits <- function(list.obj, feature, Traits){
+  
+  # Summarize counts
+  
+  s_list <- map(.x=1:length(list.obj), .f=function(i){
+    
+    message(paste0("Process Object: ", i))
+    feat <- 
+      joinWithFeatures(list.obj[[i]], features = c(feature,Traits)) %>% 
+      dplyr::select(barcodes,{{feature}}, {{Traits}} )
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature), !!sym(Traits)) %>% 
+      summarize(n=n()) %>%
+      mutate(freq = n / sum(n)) %>% 
+      pivot_wider(names_from = !!sym(Traits), values_from = freq)
+    feat[is.na(feat)]=0
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature)) %>% summarise_all(.funs = sum) %>% 
+      as.data.frame()
+    
+    feat[,feature] <-  paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+    return(feat)
+    
+  })
+  
+  names.traits <- map(s_list, .f=~names(.x)[-c(1:2)]) %>% unlist() %>% unique()
+  samples <- map(s_list, .f=~.x[,feature]) %>% unlist()
+  
+  mat <- matrix(0, nrow=length(samples), ncol=length(names.traits))
+  colnames(mat) <- names.traits; rownames(mat) <- samples
+  
+  for(i in 1:length(s_list)){
+    traits <- names(s_list[[i]])[-c(1:2)]
+    m <- s_list[[i]][,traits] %>% as.matrix()
+    rownames(m) <- s_list[[i]][,feature]
+    mat[rownames(m), traits] <- m
+  }
+  
+  
+  
+  return(mat)
+  
+}
+Traits.mat <- getTraits(list.obj, feature, Traits="subtype")
+
+
+
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, Traits.mat[seurat_obj@meta.data %>% rownames(), ])
+cur_traits <- colnames(Traits.mat)
+
+seurat_obj <- ModuleTraitCorrelation(
+  seurat_obj,
+  traits = cur_traits)
+
+mt_cor <- GetModuleTraitCorrelation(seurat_obj)
+
+keep <- 
+  map(1:nrow(t(mt_cor$pval$all_cells < 0.05)), 
+      ~any(t(mt_cor$pval$all_cells < 0.05)[.x,]==T)) %>% 
+  unlist() %>% 
+  which()
+
+
+col=colorRampPalette(c(RColorBrewer::brewer.pal(9, "BrBG")))
+library(ggcorrplot)
+ggcorrplot(t(mt_cor$cor$all_cells)[keep, ] %>% as.data.frame(), 
+           method = "circle", 
+           outline.color = "black", 
+           lab_size=1,
+           insig="pch",
+           pch="X",
+           p.mat=t(mt_cor$pval$all_cells)[keep, ])+
+  scale_fill_gradientn(colours = col(50), name="")+
+  guides(fill = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  ggtitle("Module correlation to treatment condition")+
+  xlab("")+ylab("")+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=1),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+
+interest <- rownames(t(mt_cor$cor$all_cells)[keep, ] %>% as.data.frame())
+
+
+DMEs_all <- FindAllDMEs(
+  seurat_obj,
+  group.by = 'cond',
+  wgcna_name = 'vis'
+)
+
+head(DMEs_all)
+
+sig.modules <- 
+  DMEs_all %>% 
+  filter(avg_log2FC>1 & !is.infinite(avg_log2FC)) %>% 
+  group_by(group) %>% 
+  top_n(., 50, wt=-log(p_val)) %>% 
+  arrange(desc(avg_log2FC), .by_group = T) %>% 
+  ungroup() %>% 
+  mutate(module=as.factor(module))
+col <- gplots::col2hex(sig.modules$module)
+names(col) <- sig.modules$module
+sig.modules$module <- factor(sig.modules$module, levels = sig.modules$module)
+
+#barplot
+ggplot(sig.modules, aes(fill=module, y=avg_log2FC, x=group)) + 
+  geom_bar(stat="identity",position=position_dodge())+
+  theme_classic()+
+  scale_fill_manual(values=col)
+
+p
+
+library(scattermore)
+library(ggrepel)
+#seurat_obj@misc$vis$MEs[ ] %>% pheatmap::pheatmap( cluster_rows = T)
+plotdf <- seurat_obj@misc$vis$module_umap %>% filter(color!="grey60")
+plotdf2 <- as_long_data_frame(p)
+plotdf2 <- plotdf2 %>% filter(from_name %in% plotdf$gene)
+
+# Create Plot of Expression Network
+plot_p <- ggplot()+theme_void()+coord_fixed()
+dat1 <- plotdf2 %>% filter(from_kME>0.5)
+plot_p <- 
+  plot_p+
+  geom_segment(data=dat1, 
+               mapping = aes(x=from_UMAP1, y=from_UMAP2, 
+                             xend=to_UMAP1, yend=to_UMAP2), 
+               size=dat1$from_kME*0.1, alpha=dat1$from_kME*0.1)
+
+plot_p <- plot_p+geom_scattermore(data=plotdf, 
+                                  mapping=aes(x=UMAP1, y=UMAP2),
+                                  size=plotdf$kME*2, alpha=0.1, 
+                                  color=gplots::col2hex(plotdf$color), pointsize=3)
+
+plot_p <- plot_p+
+  geom_text_repel(data=plotdf %>% group_by(module) %>% 
+                    summarise(UMAP1=mean(UMAP1), UMAP2=mean(UMAP2)), mapping=aes(x=UMAP1, y=UMAP2,label=module))
+
+plot_p <- 
+  plot_p+
+  geom_text_repel(data=plotdf %>% group_by(module) %>% 
+                    top_n(., 2, wt=kME), 
+                  mapping=aes(x=UMAP1, y=UMAP2,label=gene), size=3)
+plot_p+
+  ggtitle("Dimensional reduction of modules")+
+  xlab("UMAP 1")+ylab("UMAP 2")+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black",
+                                   angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(colour="black"))
+
+
+
+
+
+modules <- interest
+
+gcSample <- map(.x=modules, .f=function(i){
+  genes <- 
+    seurat_obj@misc$vis$wgcna_modules %>% 
+    filter(module==i) %>% 
+    rownames()
+  
+  genes <- c(unique(genes))
+})
+
+all <- unlist(gcSample)
+names(gcSample) <- modules
+
+
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+xx <- compareCluster(gcSample, 
+                     fun="enrichGO",
+                     ont ="BP", 
+                     keyType = "SYMBOL", 
+                     OrgDb = "org.Hs.eg.db")
+
+edo <- pairwise_termsim(xx)
+
+plot <- 
+  emapplot(edo, showCategory=50, cex_category=0.01, 
+           pie.params = list(pie = "equal"), 
+           cex_line = 0.3,
+           layout="graphopt", min_edge=0.15, repel=T)
+
+res_map <- 
+  edo@compareClusterResult %>% 
+  filter(Description %in% plot$data$name) %>% 
+  group_by(Description, Cluster) %>% 
+  summarise(p = mean(p.adjust)) %>% 
+  ungroup() 
+
+anno <- data.frame(name=unique(res_map$Description), type=map(.x=unique(res_map$Description), .f=function(i){
+  c <- res_map %>% filter(Description==i) %>% pull(Cluster)
+  return(c[res_map %>% filter(Description==i) %>% pull(p) %>% which.min()] %>% as.character())
+}) %>% unlist())
+
+library(ggrepel)
+plot$data <- plot$data %>% left_join(., anno, by="name")
+
+col <- plot$data$type %>% unique() %>% rev() %>% gplots::col2hex()
+
+ggplot(data=plot$data)+
+  plot$layers[[1]]+
+  geom_point(mapping = aes(x=x, y=y, fill=type, size=size), colour="black",pch=21)+
+  scale_fill_manual(values=col)+
+  theme_bw() +
+  xlab("Dim 1")+ylab("Dim 2")+
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"), 
+        axis.text.y = element_text(colour="black"))+
+  coord_fixed()+
+  geom_text_repel(mapping= aes(x,y, label=name), size=2)+
+  ggtitle("GeneSet Enrichment Analysis")
+
+
+
+
+```
+
+## Differential Gene Expression:
+```{r}
+# DE MPNST ----------------------------------------------------------------
+
+seurat_test1 <- asSeurat(list.obj[[1]])
+seurat_test2 <- asSeurat(list.obj[[3]])
+seurat_test3 <- asSeurat(list.obj[[4]])
+
+seurat_test <- merge(seurat_test1, c(seurat_test2, seurat_test3))
+
+Seurat::Idents(seurat_test) <- "subtype"
+dea_df <- Seurat::FindAllMarkers(seurat_test, logfc.threshold = 0.3, only.pos = T)
+dea_df %>% filter(avg_log2FC>0.4) %>% filter(p_val_adj<0.01) %>% group_by(cluster) %>% count()
+topn <- dea_df %>% group_by(cluster) %>% top_n(n=20, avg_log2FC)
+
+
+write.table(topn, file="~/.../DEA_MPNST.csv", sep=";")
+
+
+
+plotDeaVolcanoDEA2 <- function(dea_df, x1="Neurofibroma", x2="Schwannom"){
+  
+  left <- dea_df %>% filter(cluster==x1) %>% filter(avg_log2FC > 0)
+  right <- dea_df %>% filter(cluster==x2) %>% filter(avg_log2FC > 0) %>% mutate(avg_log2FC=-avg_log2FC)
+  
+  plot_df <- rbind(left, right)
+  
+  top <- dea_df %>% group_by(cluster) %>% top_n(., n=10, wt=avg_log2FC) %>% ungroup() %>% filter(cluster %in% c(x1,x2))
+  top <- plot_df %>% filter(gene %in% top$gene)
+  
+  
+  ggplot()+
+    geom_point(data=plot_df, mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="grey")+
+    geom_point(data=plot_df %>% filter(cluster==x1) %>% filter(p_val_adj<0.001) , mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="tomato")+
+    geom_point(data=plot_df %>% filter(cluster==x2) %>% filter(p_val_adj<0.001) , mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="steelblue")+
+    ggrepel::geom_text_repel(data = top, mapping = ggplot2::aes(x=avg_log2FC, y=-log(p_val_adj), label = .data[[col_genes]]), size = 5)+
+    theme_classic()+
+    xlim(-2,3)
+  
+  
+}
+
+
+
+corrplot::corrplot(mt_cor$cor$all_cells, 
+                   p.mat = mt_cor$pval$all_cells,
+                   sig.level=0.05,
+                   insig = "label_sig",
+                   col=colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+
+
+
+### Bring Scores to spatial data 
+
+
+gs <- map_dfr(.x=1:length(gcSample), .f=function(i){
+  data.frame(ont=names(gcSample)[i], gene=gcSample[[i]])
+}) 
+for(i in 1:length(list.obj)){list.obj[[i]]@used_genesets <- rbind(list.obj[[i]]@used_genesets, gs)}
+
+unique(gs$ont)
+col <- colorRampPalette(rev(RColorBrewer::brewer.pal(9,"Spectral")))
+col <- colorRampPalette(viridis::turbo(50))
+
+
+s=4
+
+list.obj[[s]] %>% plotSurface(color_by = "Histologie", pt_alpha = 0.0)
+
+list.obj[[s]] %>% plotSurface(color_by = "Histologie", pt_alpha = 0.3)+
+  scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(8))
+
+list.obj[[s]] %>% plotSurface(color_by = "BayesSpace", pt_alpha = 0.5)+
+  scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(11))
+
+modul="magenta"
+
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex(modul)))
+list.obj[[s]] %>% plotSurface(, color_by = modul, alpha_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.5, 0.8))+
+  theme_classic()
+
+
+modul="tan"
+
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex(modul)))
+list.obj[[s]] %>% plotSurface(, color_by = modul, alpha_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.4, 0.6))+
+  theme_classic()
+
+modul="blue"
+
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex(modul)))
+list.obj[[s]] %>% plotSurface(, color_by = modul, alpha_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.5, 1))+
+  theme_classic()
+
+
+modul="yellow"
+
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex(modul)))
+list.obj[[s]] %>% plotSurface(, color_by = modul, alpha_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.5, 0.7))+
+  theme_classic()
+
+
+### Save Results
+
+MPNST.res <- list(list.obj, seurat_obj)
+saveRDS(MPNST.res, "MPNST.res.RDS")
+
+
+```
+
+# Analysis HPNST + Neurofibroma 
+## Preprocessing
+```{r}
+#Load sample list
+samples <- readRDS("~/.../samples.RDS")
+samples <- samples %>% filter(Diagnosis %in% c("HPNST", "Neurofibrom"))
+seurat_all <- readRDS("~/.../seurat_all.RDS")
+
+
+seurat_MPNST <- subset(seurat_all, cells=seurat_all@meta.data %>% as.data.frame() %>% filter(Diagnosis %in% c("HPNST", "Neurofibrom")) %>% rownames())
+seurat_MPNST <- Seurat::DietSeurat(seurat_MPNST)
+seurat_MPNST <- SeuratWrappers::RunFastMNN(SplitObject(seurat_MPNST, split.by = "sample"))
+
+seurat_MPNST <- 
+  seurat_MPNST %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunUMAP(reduction="mnn", dims=1:20)
+
+dat.plot <- DimPlot(seurat_MPNST, group.by = c("Histologie"), label = T, raster = T)
+dat.plot <- DimPlot(seurat_MPNST, group.by = c("sample"), label = T, raster = T)
+
+hist_col <- RColorBrewer::brewer.pal(seurat_MPNST@meta.data$Histologie %>% unique() %>% length(), "Set3") 
+names(hist_col) <- seurat_MPNST@meta.data$Histologie %>% unique()
+
+ggplot(dat.plot$data)+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP_1, y=UMAP_2), pointsize = 5, color="black")+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP_1, y=UMAP_2), pointsize = 4, color="white")+
+  dat.plot$layers+
+  #scale_color_manual(values = hist_col)+
+  theme_classic()
+  
+
+
+
+plotdf <- cbind(seurat_MPNST@meta.data %>% as.data.frame() %>% dplyr::select(Diagnosis,Histologie,sample), 
+                dat.plot$data %>% dplyr::select(UMAP_1,UMAP_2))
+
+ggplot(data=plotdf, aes(x=UMAP_1, y=UMAP_2, color=Histologie))+
+  theme_void()+
+  geom_point(size=1, alpha=0.5)+
+  #dat.plot[[1]]$layers[[1]]+
+  #dat.plot$layers[[2]]+
+  scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(9, "Set1"))(11))+
+  coord_fixed()
+
+```
+## WGCNA
+```{r}
+#1. Merge Count matrix of each cluster 
+
+list.obj <- map(.x=1:nrow(samples), .f=~readRDS(samples$path[.x]) %>% SPATA2::updateSpataObject())
+feature <- "BayesSpace"
+
+list.obj[[1]] %>% plotSurface(., "BayesSpace")
+
+prepareWGCNA <- function(list.obj, feature){
+  
+  # Summarize counts
+  
+  s_list <- map(.x=1:length(list.obj), .f=function(i){
+    
+    message(paste0("Process Object: ", i))
+    feat <- 
+      joinWithFeatures(list.obj[[i]], features = feature) %>% 
+      dplyr::select(barcodes,{{feature}} ) %>% 
+      left_join(., getCountMatrix(list.obj[[i]]) %>% as.data.frame() %>% t() %>% as.data.frame()  %>% rownames_to_column("barcodes"), by="barcodes") 
+    
+    feat$barcodes <- NULL
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature)) %>% 
+      summarise_all(.fun=sum)
+    
+    feat.mat <- feat[2:ncol(feat)] %>% as.matrix() %>% t()
+    colnames(feat.mat) <- paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+    obj <- Seurat::CreateSeuratObject(feat.mat)
+    
+    return(obj)
+    
+  })
+  
+  
+  seurat <- s_list[[1]];for(i in 2:length(s_list)){seurat <- merge(seurat, s_list[[i]])}
+  seurat <- 
+    seurat %>%
+    NormalizeData() %>%
+    FindVariableFeatures() %>%
+    ScaleData() %>% 
+    SCTransform(return.only.var.genes = F)
+  
+  return(seurat)
+  
+}
+
+
+comb <- prepareWGCNA(list.obj, "BayesSpace")
+
+#Analyisis of Cluster modules
+
+merge <- comb@assays$SCT@scale.data %>% cor()
+
+samples$ID <- c("Aachen1", "Aachen4", "Aachen7", "Aachen8")
+anno.row <- 
+  comb@meta.data %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ids") %>% 
+  mutate(ID= map(.x=1:nrow(.), .f= ~c(str_split(ids[.x], "_") %>% unlist())[2] ) %>% unlist() ) %>% 
+  left_join(., samples %>% dplyr::select(ID,Diagnosis), by="ID") %>% 
+  dplyr::select(ID, Diagnosis)
+rownames(anno.row) <- rownames(comb@meta.data)
+
+anno.row <- cbind(anno.row,seurat_obj@meta.data[6:11])
+
+
+pheatmap::pheatmap(merge, annotation_col = anno.row,  color = RColorBrewer::brewer.pal(9,"RdPu"))
+
+seurat_obj@meta.data$Diagnosis <- anno.row$Diagnosis
+seurat_obj@meta.data$Neurofibrom[1:12] <- seurat_obj@meta.data$Neurofibroma[1:12]
+seurat_obj@meta.data$Neurofibroma <- NULL
+
+
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(patchwork)
+
+seurat_obj <- 
+  hdWGCNA::SetupForWGCNA(comb, gene_select = "fraction",fraction = 0.05,wgcna_name = "vis") %>% 
+  hdWGCNA::SetDatExpr(assay="RNA") %>% 
+  hdWGCNA::TestSoftPowers()
+
+#Check Network Con
+wrap_plots(hdWGCNA::PlotSoftPowers(seurat_obj), ncol=2)
+
+#Get Network
+seurat_obj <- hdWGCNA::ConstructNetwork(seurat_obj,soft_power=7,tom_name='test',overwrite_tom=TRUE)
+
+# plot the dendrogram
+hdWGCNA::PlotDendrogram(seurat_obj, main='WGCNA dendrogram')
+seurat_obj <- hdWGCNA::ModuleEigengenes(seurat_obj, assay = "RNA",npcs = 10)
+seurat_obj <- hdWGCNA::ModuleConnectivity(seurat_obj)
+
+#HubGeneNetworkPlot(seurat_obj,n_hubs = 10, n_other=20, edge_prop = 0.25,mods = 'all', vertex.label=NA)
+
+seurat_obj <- RunModuleUMAP(
+  seurat_obj,
+  n_hubs = 5,
+  n_neighbors=5,
+  min_dist=0.1,
+  spread=2,
+  wgcna_name = 'vis',
+  target_weight=0.05,
+  supervised=TRUE
+)
+
+p=ModuleUMAPPlot(
+  seurat_obj,
+  edge.alpha=0.25,
+  sample_edges=TRUE,
+  edge_prop=0.2, 
+  label_hubs=2,
+  return_graph=T,
+  keep_grey_edges=FALSE)
+
+library(igraph)
+library(scattermore)
+library(ggrepel)
+
+
+seurat_obj@misc$vis$MEs[ ] %>% pheatmap::pheatmap( cluster_rows = T)
+plotdf <- seurat_obj@misc$vis$module_umap %>% filter(color!="grey60")
+plotdf2 <- as_long_data_frame(p)
+plotdf2 <- plotdf2 %>% filter(from_name %in% plotdf$gene)
+
+# Create Plot of Expression Network
+plot_p <- ggplot()+theme_void()+coord_fixed()
+dat1 <- plotdf2 %>% filter(from_kME>0.5)
+plot_p <- plot_p+geom_segment(data=dat1, mapping = aes(x=from_UMAP1, y=from_UMAP2, xend=to_UMAP1, yend=to_UMAP2), size=dat1$from_kME*0.1, alpha=dat1$from_kME*0.1)
+plot_p <- plot_p+geom_scattermore(data=plotdf, mapping=aes(x=UMAP1, y=UMAP2),size=plotdf$kME*2, alpha=0.1, color=gplots::col2hex(plotdf$color), pointsize=3)
+plot_p <- plot_p+theme_void()+geom_text_repel(data=plotdf %>% group_by(module) %>% summarise(UMAP1=mean(UMAP1), UMAP2=mean(UMAP2)), mapping=aes(x=UMAP1, y=UMAP2,label=module))
+plot_p <- plot_p+geom_text_repel(data=plotdf %>% group_by(module) %>% top_n(., 10, wt=kME), mapping=aes(x=UMAP1, y=UMAP2,label=gene))
+plot_p
+```
+## Differential Gene Expression:
+```{r}
+## DE Analysis
+ModuleCorrelogram(seurat_obj)
+
+DMEs_all <- FindAllDMEs(
+  seurat_obj,
+  group.by = 'Diagnosis',
+  wgcna_name = 'vis'
+)
+
+head(DMEs_all)
+
+sig.modules <- 
+  DMEs_all %>% 
+  filter(avg_log2FC>1 & !is.infinite(avg_log2FC)) %>% 
+  group_by(group) %>% 
+  top_n(., 50, wt=-log(p_val)) %>% 
+  arrange(desc(avg_log2FC), .by_group = T) %>% 
+  ungroup() %>% 
+  mutate(module=as.factor(module))
+col <- gplots::col2hex(sig.modules$module)
+names(col) <- sig.modules$module
+sig.modules$module <- factor(sig.modules$module, levels = sig.modules$module)
+
+#barplot
+ggplot(sig.modules, aes(fill=module, y=avg_log2FC, x=group)) + 
+  geom_bar(stat="identity",position=position_dodge())+
+  theme_classic()+
+  scale_fill_manual(values=col)
+
+
+# Gene Set Enrichment Analysis 
+library(enrichR)
+library(GeneOverlap)
+dbs <- c('GO_Biological_Process_2021','GO_Cellular_Component_2021','GO_Molecular_Function_2021')
+seurat_obj <- RunEnrichr( seurat_obj,dbs=dbs, max_genes = 100 )
+v <- GetEnrichrTable(seurat_obj)
+write.table(v, file="~/Desktop/Aachen_NP/Manuscript/Tables/EnrichR_benign_PNST.csv", sep=";")
+
+
+
+EnrichPlot_new <- function (seurat_obj, 
+                            database, 
+                            mods = "all", 
+                            n_terms = 3, 
+                            break_ties = TRUE, 
+                            logscale = TRUE, 
+                            wgcna_name = NULL, ...) {
+  if (is.null(wgcna_name)) {
+    wgcna_name <- seurat_obj@misc$active_wgcna
+  }
+  modules <- GetModules(seurat_obj, wgcna_name)
+  if (mods[1] == "all") {
+    mods <- levels(modules$module)
+    mods <- mods[mods != "grey"]
+  }
+  enrichr_df <- GetEnrichrTable(seurat_obj, wgcna_name)
+  mod_colors <- select(modules, c(module, color)) %>% distinct
+  enrichr_df$color <- mod_colors[match(enrichr_df$module, mod_colors$module), 
+                                 "color"]
+  wrapText <- function(x, len) {
+    sapply(x, function(y) paste(strwrap(y, len), collapse = "\n"), 
+           USE.NAMES = FALSE)
+  }
+  plot_df <- enrichr_df %>% subset(db == database & module %in% 
+                                     mods) %>% group_by(module) %>% top_n(n_terms, wt = Combined.Score)
+  if (break_ties) {
+    plot_df <- do.call(rbind, lapply(plot_df %>% group_by(module) %>% 
+                                       group_split, function(x) {
+                                         x[sample(n_terms), ]
+                                       }))
+  }
+  #plot_df$Term <- wrapText(plot_df$Term, 45)
+  
+  plot_df$Term <- plot_df$Term %>% str_replace_all(., "-", " ")
+  if (mods[1] == "all") {
+    plot_df$module <- factor(as.character(plot_df$module), levels = levels(modules$module))
+  }else{
+    plot_df$module <- factor(plot_df$module, levels = mods)
+  }
+  
+  plot_df <- arrange(plot_df, module)
+  plot_df$Term <- factor(as.character(plot_df$Term), levels = unique(as.character(plot_df$Term)))
+  if (logscale) {
+    plot_df$Combined.Score <- log(plot_df$Combined.Score)
+    lab <- "Enrichment\nlog(combined score)"
+    x <- 0.2
+  }
+  else {
+    lab <- "Enrichment\n(combined score)"
+    x <- 5
+  }
+  p <- plot_df %>% ggplot(aes(x = module, y = Term)) + geom_point(aes(size = Combined.Score, color = Combined.Score), 
+  ) + RotatedAxis() + ylab("") + xlab("") + 
+    labs(size = lab) + scale_y_discrete(limits = rev) + ggtitle(database) + 
+    theme(plot.title = element_text(hjust = 0.5), axis.line.x = element_blank(), 
+          axis.line.y = element_blank(), panel.border = element_rect(colour = "black", 
+                                                                     fill = NA, size = 1))
+  p
+}
+
+p=EnrichPlot_new(
+  seurat_obj,
+  mods = "all",
+  database = "GO_Cellular_Component_2021", # this has to be one of the lists we used above!!!
+  n_terms=5 
+)+theme_classic()+
+  scale_colour_gradientn(colors =colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+p
+
+p=EnrichPlot_new(
+  seurat_obj,
+  mods = c("red", "royalblue", "lightcyan", "brown", "purple"),
+  database = "GO_Molecular_Function_2021", # this has to be one of the lists we used above!!!
+  n_terms=5,
+)+theme_classic()+
+  scale_colour_gradientn(colors =colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+p
+
+
+kME <- seurat_obj@misc$vis$wgcna_modules 
+gcSample <- map(.x=unique(kME$color), .f=function(i){
+  
+  kME %>% filter(color==i) %>% arrange(desc(!!sym(paste0("kME_",i)))) %>% head(300) %>% rownames()
+  
+  
+})
+names(gcSample) <- unique(kME$color)
+gcSample <- gcSample[which(c(map(gcSample, .f=~length(.x)) %>% unlist())>50)]
+
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+xx <- compareCluster(gcSample, 
+                     fun="enrichGO",
+                     ont ="BP", 
+                     keyType = "SYMBOL", 
+                     OrgDb = "org.Hs.eg.db")
+
+library(DOSE)
+library(enrichplot)
+edo <- pairwise_termsim(xx)
+
+plot <- emapplot(edo, showCategory=50, cex_category=0.01, pie="Count", cex_line = 0.3, layout="graphopt", min_edge=0.15, repel=T)
+plot
+
+dotplot(edo, showCategory=3)+theme_classic()+scale_colour_gradientn(colors ="black")
+
+
+
+res_map <- 
+  edo@compareClusterResult %>% 
+  filter(Description %in% plot$data$name) %>% 
+  group_by(Description, Cluster) %>% 
+  summarise(p = mean(p.adjust)) %>% 
+  ungroup() 
+
+anno <- data.frame(name=unique(res_map$Description), type=map(.x=unique(res_map$Description), .f=function(i){
+  
+  
+  c <- res_map %>% filter(Description==i) %>% pull(Cluster)
+  return(c[res_map %>% filter(Description==i) %>% pull(p) %>% which.min()] %>% as.character())
+}) %>% unlist())
+anno$type <- factor(anno$type, levels =names(gcSample) )
+plot$data <- plot$data %>% dplyr::left_join(., anno, by="name")
+
+col.test <- gplots::col2hex(unique(plot$data$type))
+names(col.test) <- unique(plot$data$type)
+
+ggplot(data=plot$data)+
+  plot$layers[[1]]+
+  geom_point(mapping = aes(x=x, y=y, size=size, color=type))+ # %>% scales::muted()+
+  theme_classic()+
+  scale_color_manual(values = col.test)
+
+
+### Get Traits to WGCNA Analysis
+
+getTraits <- function(list.obj, feature, Traits){
+  
+  # Summarize counts
+  
+  s_list <- map(.x=1:length(list.obj), .f=function(i){
+    
+    message(paste0("Process Object: ", i))
+    feat <- 
+      joinWithFeatures(list.obj[[i]], features = c(feature,Traits)) %>% 
+      dplyr::select(barcodes,{{feature}}, {{Traits}} )
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature), !!sym(Traits)) %>% 
+      summarize(n=n()) %>%
+      mutate(freq = n / sum(n)) %>% 
+      pivot_wider(names_from = !!sym(Traits), values_from = freq)
+    feat[is.na(feat)]=0
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature)) %>% summarise_all(.funs = sum) %>% 
+      as.data.frame()
+    
+    feat[,feature] <-  paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+    return(feat)
+    
+  })
+  
+  names.traits <- map(s_list, .f=~names(.x)[-c(1:2)]) %>% unlist() %>% unique()
+  samples <- map(s_list, .f=~.x[,feature]) %>% unlist()
+  
+  mat <- matrix(0, nrow=length(samples), ncol=length(names.traits))
+  colnames(mat) <- names.traits; rownames(mat) <- samples
+  
+  for(i in 1:length(s_list)){
+    traits <- names(s_list[[i]])[-c(1:2)]
+    m <- s_list[[i]][,traits] %>% as.matrix()
+    rownames(m) <- s_list[[i]][,feature]
+    mat[rownames(m), traits] <- m
+  }
+  
+  
+  
+  return(mat)
+  
+}
+Traits.mat <- getTraits(list.obj, feature, Traits="Histologie")
+
+
+
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, Traits.mat[seurat_obj@meta.data %>% rownames(), ])
+cur_traits <- colnames(Traits.mat)
+
+seurat_obj <- ModuleTraitCorrelation(
+  seurat_obj,
+  traits = cur_traits[2:6])
+
+mt_cor <- GetModuleTraitCorrelation(seurat_obj)
+
+ModuleCorrelogram(seurat_obj)
+
+corrplot::corrplot(mt_cor$cor$all_cells, 
+                   p.mat = mt_cor$pval$all_cells,
+                   sig.level=0.05,
+                   insig = "label_sig",
+                   col=colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+
+
+
+### Bring Scores to spatial data 
+
+
+gs <- map_dfr(.x=1:length(gcSample), .f=function(i){
+  data.frame(ont=names(gcSample)[i], gene=gcSample[[i]])
+}) 
+for(i in 1:length(list.obj)){list.obj[[i]]@used_genesets <- rbind(list.obj[[i]]@used_genesets, gs)}
+
+unique(gs$ont)
+col <- colorRampPalette(rev(RColorBrewer::brewer.pal(9,"Spectral")))
+col <- colorRampPalette(viridis::turbo(50))
+
+
+
+
+expression_plot(list.obj[[1]], gene="GM2A")
+
+expression_plot <- function(obj, gene, col="Reds",limits, hull.add=T){
+  obj <- SPATA2::updateSpataObject(obj)
+  hull <-   
+    getCoordsDf(obj) %>% 
+    ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+  
+  df <- SPATA2::joinWith(obj, genes=gene, normalize = T, smooth = F)
+  names(df)[7] <- "gene"
+  
+  obj@information$active_mtr <- "denoised"
+  p1 <- SPATA2::plotSurface2(df, 
+                             color_by = "gene", 
+                             alpha_by = "gene",
+                             pt_clrsp=col,
+                             limits=limits,
+                             oob=scales::squish)+
+    SPATA2::ggpLayerAxesSI(obj)+
+    ggtitle(gene)
+  
+  if(hull.add==T){p1 <- p1+hull}
+  
+  return(p1)
+}
+feature_plot <- function(obj, feature){
+
+  hull <-   
+    getCoordsDf(obj) %>% 
+    ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+  
+  p1 <- SPATA2::plotSurface(obj, 
+                            color_by = feature, 
+                            display_image = F)+
+    hull+
+    SPATA2::ggpLayerAxesSI(obj)+
+    ggtitle(feature)
+  return(p1)
+}
+Module_plot <- function(obj, module, gcSample, limits=c(0,1), smooth=T){
+
+  hull <-   
+    getCoordsDf(obj) %>% 
+    ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+  
+  genes <- gcSample[[module]]
+  df <- SPATA2::joinWith(obj, genes=genes, normalize = T, smooth = smooth, average_genes = T)
+  names(df)[7] <- "gene"
+  
+  obj@information$active_mtr <- "denoised"
+  
+  col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex(module)))
+  
+  
+  p1 <- SPATA2::plotSurface2(df, 
+                             color_by = "gene", 
+                             alpha_by = "gene",
+                             limits=limits,
+                             oob=scales::squish)+
+    hull+
+    SPATA2::ggpLayerAxesSI(obj)+
+    ggtitle(module)+
+    scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=limits)
+  return(p1)
+}
+
+
+hist_col_new <- c("#80B1D3", "#FFFFB3"); names(hist_col_new) <- c("Neurofibroma", "Schwannoma")
+
+feature_plot(list.obj[[1]], feature="Histologie")+scale_color_manual(values=hist_col_new)+
+  Module_plot(list.obj[[1]], module="turquoise", gcSample, limits=c(0.5,0.8))
+
+Module_plot(list.obj[[2]], module="cyan", gcSample, limits=c(0.3,0.7))
+Module_plot(list.obj[[3]], module="cyan", gcSample, limits=c(0.3,0.7))
+Module_plot(list.obj[[4]], module="cyan", gcSample, limits=c(0.3,0.7))
+
+
+feature_plot(list.obj[[3]], feature="Histologie")+
+  Module_plot(list.obj[[3]], module="green", gcSample, limits=c(0.4,0.6))
+
+
+list.obj[[1]] %>% plotSurface(pt_alpha = 0)
+
+
+
+# Plot with module specific scores
+
+plotdf <- seurat_obj@misc$vis$module_umap %>% filter(color!="grey60")
+FAX <- 
+  DMEs_all %>% mutate(avg_log2FC=if_else(is.infinite(avg_log2FC), 0, avg_log2FC),
+                      score=scales::rescale(avg_log2FC, c(0,1))) %>% 
+  filter(group=="Neurofibrom")
+
+plotdf <- plotdf %>% left_join(., FAX %>% select(module, score), by="module")
+
+plot_p <- ggplot()+coord_fixed()
+plot_p <- plot_p+geom_scattermore(data=plotdf, mapping=aes(x=UMAP1, y=UMAP2, color=score),
+                                  size=plotdf$kME*2, alpha=0.1, 
+                                  pointsize=6)
+
+genes_lable <- plotdf %>%  filter(module %in% unique(FAX$module)) %>% filter(score>0.6) %>% group_by(module) %>% top_n(., 5, wt=kME)
+genes_lable <- genes_lable[!duplicated(genes_lable$gene), ]
+
+plot_p <- plot_p+geom_text_repel(data=genes_lable, 
+                                 mapping=aes(x=UMAP1, y=UMAP2,label=gene))+theme_void()
+plot_p+scale_colour_gradientn(colors =colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50), limit=c(0.3, 0.75), oob=scales::squish)
+
+
+
+
+
+
+plotdf <- seurat_obj@misc$vis$module_umap %>% filter(color!="grey60")
+
+FAX <- seurat_obj@misc$vis$mt_cor$cor$all_cells %>% reshape2::melt() %>% pivot_wider(names_from = Var1, values_from = value)
+names(FAX)[1] <- "module"
+plotdf <- plotdf %>% left_join(., FAX %>% select(module, "Schwannoma"), by="module")
+names(plotdf)[8] <- "score"
+
+plot_p <- ggplot()+coord_fixed()
+plot_p <- plot_p+geom_scattermore(data=plotdf, mapping=aes(x=UMAP1, y=UMAP2, color=score),
+                                  size=plotdf$kME*2, alpha=0.1, 
+                                  pointsize=6)
+
+genes_lable <- plotdf %>%  filter(module %in% unique(FAX$module)) %>% filter(score>0.3) %>% group_by(module) %>% top_n(., 5, wt=kME)
+
+genes_lable <- genes_lable[!duplicated(genes_lable$gene), ]
+
+plot_p <- plot_p+geom_text_repel(data=genes_lable, 
+                                 mapping=aes(x=UMAP1, y=UMAP2,label=gene))+theme_void()
+
+plot_p+scale_colour_gradientn(colors =colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50), limit=c(0, 0.4), oob=scales::squish)
+
+
+
+
+
+
+
+modul="APOD"
+
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex("Red")))
+list.obj[[s]] %>% plotSurface(., color_by = modul, alpha_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.2, 0.7))+
+  theme_classic()
+
+
+modul="VIM"
+
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex("blue")))
+list.obj[[s]] %>% plotSurface(., color_by = modul, alpha_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.5, 0.7))+
+  theme_classic()
+
+
+# Heatmap of gene Expression of module 
+
+gse <- enrichGO(gene=gcSample$greenyellow, 
+                ont ="ALL", 
+                keyType = "SYMBOL", 
+                OrgDb = "org.Hs.eg.db")
+dotplot(gse, showCategory=30)+theme_classic()+scale_colour_gradientn(colors="black")
+
+modul=gcSample$greenyellow[1:12]
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex("greenyellow")))
+list.obj[[s]] %>% plotSurfaceComparison(., color_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.25, 0.6))+
+  theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+
+
+
+gse <- enrichGO(gene=gcSample$tan, 
+                ont ="ALL", 
+                keyType = "SYMBOL", 
+                OrgDb = "org.Hs.eg.db")
+dotplot(gse, showCategory=30)+theme_classic()+scale_colour_gradientn(colors="black")
+
+modul=gcSample$tan[1:12]
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex("tan")))
+list.obj[[s]] %>% plotSurfaceComparison(., color_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.4, 0.7))+
+  theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+
+
+### Save Results
+
+HPNST.res <- list(list.obj, seurat_obj)
+saveRDS(HPNST.res, "HPNST+Neurofibroma.res.RDS")
+```
+
+## HPNST alone
+```{r}
+###################################################################
+#####  Analyse Pro Tumor Type: HPNST alone
+###################################################################
+
+#Load sample list
+samples <- readRDS("~/.../samples.RDS")
+samples <- samples %>% filter(Diagnosis %in% c("HPNST"))
+seurat_all <- readRDS("~/.../seurat_all.RDS")
+
+seurat_MPNST <- subset(seurat_all, cells=seurat_all@meta.data %>% as.data.frame() %>% filter(Diagnosis %in% c("HPNST")) %>% rownames())
+seurat_MPNST <- Seurat::DietSeurat(seurat_MPNST)
+seurat_MPNST <- SeuratWrappers::RunFastMNN(SplitObject(seurat_MPNST, split.by = "sample"))
+
+seurat_MPNST <- 
+  seurat_MPNST %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunUMAP(reduction="mnn", dims=1:20)
+
+dat.plot <- DimPlot(seurat_MPNST, group.by = c("Histologie"), label = T, raster = T)
+dat.plot <- DimPlot(seurat_MPNST, group.by = c("sample"), label = T, raster = T)
+
+hist_col <- RColorBrewer::brewer.pal(seurat_MPNST@meta.data$Histologie %>% unique() %>% length(), "Set3") 
+names(hist_col) <- seurat_MPNST@meta.data$Histologie %>% unique()
+
+ggplot(dat.plot$data)+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP_1, y=UMAP_2), pointsize = 5, color="black")+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP_1, y=UMAP_2), pointsize = 4, color="white")+
+  dat.plot$layers+
+  scale_color_manual(values = hist_col)+
+  theme_classic()
+
+seurat_MPNST@meta.data$Histologie[seurat_MPNST@meta.data$Histologie=="unnamed"] <- "Neurofibroma"
+seurat_MPNST@meta.data$Histologie[seurat_MPNST@meta.data$Histologie=="Schwannom/Nerv"] <- "Schwannom"
+
+Seurat::Idents(seurat_MPNST) <- "Histologie"
+dea_df <- Seurat::FindAllMarkers(seurat_MPNST)
+dea_df %>% filter(avg_log2FC>0.2) %>% filter(p_val<0.01) %>%  group_by(cluster) %>% count()
+
+write.table(dea_df, file="~/Desktop/Aachen_NP/Manuscript/Tables/DEA_HPNST.csv", sep=";")
+
+
+col_genes
+plotDeaVolcanoDEA2 <- function(dea_df, x1="Neurofibroma", x2="Schwannom"){
+  
+  left <- dea_df %>% filter(cluster==x1) %>% filter(avg_log2FC > 0)
+  right <- dea_df %>% filter(cluster==x2) %>% filter(avg_log2FC > 0) %>% mutate(avg_log2FC=-avg_log2FC)
+  
+  plot_df <- rbind(left, right)
+
+  top <- dea_df %>% group_by(cluster) %>% top_n(., n=10, wt=avg_log2FC) %>% ungroup() %>% filter(cluster %in% c(x1,x2))
+  top <- plot_df %>% filter(gene %in% top$gene)
+  
+  
+  ggplot()+
+    geom_point(data=plot_df, mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="grey")+
+    geom_point(data=plot_df %>% filter(cluster==x1) %>% filter(p_val_adj<0.001) , mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="tomato")+
+    geom_point(data=plot_df %>% filter(cluster==x2) %>% filter(p_val_adj<0.001) , mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="steelblue")+
+    ggrepel::geom_text_repel(data = top, mapping = ggplot2::aes(x=avg_log2FC, y=-log(p_val_adj), label = .data[[col_genes]]), size = 5)+
+    theme_classic()+
+    xlim(-2,3)
+  
+  
+}
+
+
+
+expression_plot(list.obj[[1]], gene = "S100B", col = "Blues", limits = c(0.5,1))
+expression_plot(list.obj[[1]], gene = "VIM", col = "Blues", limits = c(0.5,1))
+expression_plot(list.obj[[1]], gene = "APOD", col = "Reds", limits = c(0.2,0.8))
+expression_plot(list.obj[[1]], gene = "DCN", col = "Reds", limits = c(0.2,0.8))
+  
+
+
+
+plotdf <- cbind(seurat_MPNST@meta.data %>% as.data.frame() %>% dplyr::select(Diagnosis,Histologie,sample), 
+                dat.plot$data %>% dplyr::select(UMAP_1,UMAP_2))
+
+ggplot(data=plotdf, aes(x=UMAP_1, y=UMAP_2, color=Histologie))+
+  theme_void()+
+  geom_point(size=1, alpha=0.5)+
+  #dat.plot[[1]]$layers[[1]]+
+  #dat.plot$layers[[2]]+
+  scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(9, "Set1"))(11))+
+  coord_fixed()
+
+# Run WGCNA on differentially Clusters
+
+
+#1. Merge Count matrix of each cluster 
+
+list.obj <- map(.x=1:nrow(samples), .f=~readRDS(samples$path[.x]) %>% SPATA2::updateSpataObject())
+feature <- "BayesSpace"
+
+list.obj[[1]] %>% plotSurface(., "BayesSpace")
+
+prepareWGCNA <- function(list.obj, feature){
+  
+  # Summarize counts
+  
+  s_list <- map(.x=1:length(list.obj), .f=function(i){
+    
+    message(paste0("Process Object: ", i))
+    feat <- 
+      joinWithFeatures(list.obj[[i]], features = feature) %>% 
+      dplyr::select(barcodes,{{feature}} ) %>% 
+      left_join(., getCountMatrix(list.obj[[i]]) %>% as.data.frame() %>% t() %>% as.data.frame()  %>% rownames_to_column("barcodes"), by="barcodes") 
+    
+    feat$barcodes <- NULL
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature)) %>% 
+      summarise_all(.fun=sum)
+    
+    feat.mat <- feat[2:ncol(feat)] %>% as.matrix() %>% t()
+    colnames(feat.mat) <- paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+    obj <- Seurat::CreateSeuratObject(feat.mat)
+    
+    return(obj)
+    
+  })
+  
+  
+  seurat <- s_list[[1]];for(i in 2:length(s_list)){seurat <- merge(seurat, s_list[[i]])}
+  seurat <- 
+    seurat %>%
+    NormalizeData() %>%
+    FindVariableFeatures() %>%
+    ScaleData() %>% 
+    SCTransform(return.only.var.genes = F)
+  
+  return(seurat)
+  
+}
+
+
+comb <- prepareWGCNA(list.obj, "BayesSpace")
+
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(patchwork)
+
+seurat_obj <- 
+  hdWGCNA::SetupForWGCNA(comb, gene_select = "fraction",fraction = 0.05,wgcna_name = "vis") %>% 
+  hdWGCNA::SetDatExpr(assay="RNA") %>% 
+  hdWGCNA::TestSoftPowers()
+
+#Check Network Con
+wrap_plots(hdWGCNA::PlotSoftPowers(seurat_obj), ncol=2)
+
+#Get Network
+setwd("~/.../Analysis_WGCNA_HPNST")
+seurat_obj <- hdWGCNA::ConstructNetwork(seurat_obj,soft_power=6,tom_name='test',overwrite_tom=TRUE)
+
+# plot the dendrogram
+hdWGCNA::PlotDendrogram(seurat_obj, main='WGCNA dendrogram')
+seurat_obj <- hdWGCNA::ModuleEigengenes(seurat_obj, assay = "RNA",npcs = 10)
+seurat_obj <- hdWGCNA::ModuleConnectivity(seurat_obj)
+
+#HubGeneNetworkPlot(seurat_obj,n_hubs = 10, n_other=20, edge_prop = 0.25,mods = 'all', vertex.label=NA)
+
+seurat_obj <- RunModuleUMAP(
+  seurat_obj,
+  n_hubs = 5,
+  n_neighbors=5,
+  min_dist=0.1,
+  spread=2,
+  wgcna_name = 'vis',
+  target_weight=0.05,
+  supervised=TRUE
+)
+
+p=ModuleUMAPPlot(
+  seurat_obj,
+  edge.alpha=0.25,
+  sample_edges=TRUE,
+  edge_prop=0.2, 
+  label_hubs=2,
+  return_graph=T,
+  keep_grey_edges=FALSE)
+
+library(igraph)
+library(scattermore)
+library(ggrepel)
+
+
+seurat_obj@misc$vis$MEs[ ] %>% pheatmap::pheatmap( cluster_rows = T)
+plotdf <- seurat_obj@misc$vis$module_umap %>% filter(color!="grey60")
+plotdf2 <- as_long_data_frame(p)
+plotdf2 <- plotdf2 %>% filter(from_name %in% plotdf$gene)
+
+# Create Plot of Expression Network
+plot_p <- ggplot()+theme_void()+coord_fixed()
+dat1 <- plotdf2 %>% filter(from_kME>0.5)
+plot_p <- plot_p+geom_segment(data=dat1, mapping = aes(x=from_UMAP1, y=from_UMAP2, xend=to_UMAP1, yend=to_UMAP2), size=dat1$from_kME*0.1, alpha=dat1$from_kME*0.1)
+plot_p <- plot_p+geom_scattermore(data=plotdf, mapping=aes(x=UMAP1, y=UMAP2),size=plotdf$kME*2, alpha=0.1, color=gplots::col2hex(plotdf$color), pointsize=3)
+plot_p <- plot_p+theme_void()+geom_text_repel(data=plotdf %>% group_by(module) %>% summarise(UMAP1=mean(UMAP1), UMAP2=mean(UMAP2)), mapping=aes(x=UMAP1, y=UMAP2,label=module))
+plot_p <- plot_p+geom_text_repel(data=plotdf %>% group_by(module) %>% top_n(., 5, wt=kME), mapping=aes(x=UMAP1, y=UMAP2,label=gene))
+plot_p
+
+## Add Histology
+### Get Traits to WGCNA Analysis
+
+getTraits <- function(list.obj, feature, Traits){
+  
+  # Summarize counts
+  
+  s_list <- map(.x=1:length(list.obj), .f=function(i){
+    
+    message(paste0("Process Object: ", i))
+    feat <- 
+      joinWithFeatures(list.obj[[i]], features = c(feature,Traits)) %>% 
+      dplyr::select(barcodes,{{feature}}, {{Traits}} )
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature), !!sym(Traits)) %>% 
+      summarize(n=n()) %>%
+      mutate(freq = n / sum(n)) %>% 
+      pivot_wider(names_from = !!sym(Traits), values_from = freq)
+    feat[is.na(feat)]=0
+    
+    feat <- 
+      feat %>% 
+      group_by(!!sym(feature)) %>% summarise_all(.funs = sum) %>% 
+      as.data.frame()
+    
+    feat[,feature] <-  paste0("S_", getSampleNames(list.obj[[i]]), "_", as.character(feat %>% pull(!!sym(feature))))
+    return(feat)
+    
+  })
+  
+  names.traits <- map(s_list, .f=~names(.x)[-c(1:2)]) %>% unlist() %>% unique()
+  samples <- map(s_list, .f=~.x[,feature]) %>% unlist()
+  
+  mat <- matrix(0, nrow=length(samples), ncol=length(names.traits))
+  colnames(mat) <- names.traits; rownames(mat) <- samples
+  
+  for(i in 1:length(s_list)){
+    traits <- names(s_list[[i]])[-c(1:2)]
+    m <- s_list[[i]][,traits] %>% as.matrix()
+    rownames(m) <- s_list[[i]][,feature]
+    mat[rownames(m), traits] <- m
+  }
+  
+  
+  
+  return(mat)
+  
+}
+Traits.mat <- getTraits(list.obj, feature, Traits="Histologie")
+
+
+
+seurat_obj@meta.data <- cbind(seurat_obj@meta.data, Traits.mat[seurat_obj@meta.data %>% rownames(), ])
+cur_traits <- colnames(Traits.mat)
+
+seurat_obj <- ModuleTraitCorrelation(
+  seurat_obj,
+  traits = cur_traits)
+
+mt_cor <- GetModuleTraitCorrelation(seurat_obj)
+
+ModuleCorrelogram(seurat_obj)
+
+corrplot::corrplot(mt_cor$cor$all_cells, 
+                   p.mat = mt_cor$pval$all_cells,
+                   sig.level=0.05,
+                   insig = "label_sig",
+                   col=colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+
+
+# Gene Set Enrichment Analysis 
+library(enrichR)
+library(GeneOverlap)
+dbs <- c('GO_Biological_Process_2021','GO_Cellular_Component_2021','GO_Molecular_Function_2021')
+seurat_obj <- RunEnrichr( seurat_obj,dbs=dbs, max_genes = 100)
+v <- GetEnrichrTable(seurat_obj)
+
+write.table(v, file="~/.../GeneSetEnrichment_HPNST_alone.csv", sep=";")
+
+EnrichPlot_new <- function (seurat_obj, 
+                            database, 
+                            mods = "all", 
+                            n_terms = 3, 
+                            break_ties = TRUE, 
+                            logscale = TRUE, 
+                            wgcna_name = NULL, ...) {
+  if (is.null(wgcna_name)) {
+    wgcna_name <- seurat_obj@misc$active_wgcna
+  }
+  modules <- GetModules(seurat_obj, wgcna_name)
+  if (mods[1] == "all") {
+    mods <- levels(modules$module)
+    mods <- mods[mods != "grey"]
+  }
+  enrichr_df <- GetEnrichrTable(seurat_obj, wgcna_name)
+  mod_colors <- select(modules, c(module, color)) %>% distinct
+  enrichr_df$color <- mod_colors[match(enrichr_df$module, mod_colors$module), 
+                                 "color"]
+  
+  enrichr_df <- read.table("/.../GeneSetEnrichment_HPNST_alone.csv", sep=";", header=T)
+  enrichr_df$color <- enrichr_df$module
+  
+  wrapText <- function(x, len) {
+    sapply(x, function(y) paste(strwrap(y, len), collapse = "\n"), 
+           USE.NAMES = FALSE)
+  }
+  plot_df <- enrichr_df %>% subset(db == database & module %in% 
+                                     mods) %>% group_by(module) %>% top_n(n_terms, wt = Combined.Score)
+  if (break_ties) {
+    plot_df <- do.call(rbind, lapply(plot_df %>% group_by(module) %>% 
+                                       group_split, function(x) {
+                                         x[sample(n_terms), ]
+                                       }))
+  }
+  #plot_df$Term <- wrapText(plot_df$Term, 45)
+  
+  plot_df$Term <- plot_df$Term %>% str_replace_all(., "-", " ")
+  if (mods[1] == "all") {
+    plot_df$module <- factor(as.character(plot_df$module), levels = levels(modules$module))
+  }else{
+    plot_df$module <- factor(plot_df$module, levels = mods)
+  }
+  
+  plot_df <- arrange(plot_df, module)
+  plot_df$Term <- factor(as.character(plot_df$Term), levels = unique(as.character(plot_df$Term)))
+  if (logscale) {
+    plot_df$Combined.Score <- log(plot_df$Combined.Score)
+    lab <- "Enrichment\nlog(combined score)"
+    x <- 0.2
+  }
+  else {
+    lab <- "Enrichment\n(combined score)"
+    x <- 5
+  }
+  p <- plot_df %>% ggplot(aes(x = module, y = Term)) + geom_point(aes(size = Combined.Score, color = Combined.Score), 
+  ) + RotatedAxis() + ylab("") + xlab("") + 
+    labs(size = lab) + scale_y_discrete(limits = rev) + ggtitle(database) + 
+    theme(plot.title = element_text(hjust = 0.5), axis.line.x = element_blank(), 
+          axis.line.y = element_blank(), panel.border = element_rect(colour = "black", 
+                                                                     fill = NA, size = 1))
+  p
+}
+
+
+
+p=EnrichPlot_new(
+  seurat_obj,
+  mods = "all",
+  database = "GO_Cellular_Component_2021", # this has to be one of the lists we used above!!!
+  n_terms=5 
+)+theme_classic()+
+  scale_colour_gradientn(colors =colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+p
+
+p=EnrichPlot_new(
+  seurat_obj,
+  mods = c("greenyellow", "tan"),
+  database = "GO_Biological_Process_2021", # this has to be one of the lists we used above!!!
+  n_terms=10,
+)+theme_classic()+
+  scale_colour_gradientn(colors =colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+p
+
+
+expression_plot(list.obj[[2]], gene = "CD3D", col = "Grays", limits = c(0.1,0.5))
+expression_plot(list.obj[[1]], gene = "AIF1", col = "Grays", limits = c(0.1,0.5))
+expression_plot(list.obj[[2]], gene = "CD68", col = "Grays", limits = c(0.4,0.8))
+expression_plot(list.obj[[2]], gene = "CD163", col = "Grays", limits = c(0.2,0.6))
+
+
+expression_plot(list.obj[[2]], gene = "CD19", col = "Grays", limits = c(0.15,0.8), hull.add=F)
+expression_plot(list.obj[[1]], gene = "CD79A", col = "Grays", limits = c(0.1,0.8))
+expression_plot(list.obj[[1]], gene = "IGHM", col = "Grays", limits = c(0.1,0.8))
+
+
+
+kME <- seurat_obj@misc$vis$wgcna_modules 
+gcSample <- map(.x=unique(kME$color), .f=function(i){
+  
+  kME %>% filter(color==i) %>% arrange(desc(!!sym(paste0("kME_",i)))) %>% head(300) %>% rownames()
+  
+  
+})
+names(gcSample) <- unique(kME$color)
+gcSample <- gcSample[which(c(map(gcSample, .f=~length(.x)) %>% unlist())>50)]
+
+library(DOSE)
+library(enrichplot)
+library(clusterProfiler)
+xx <- compareCluster(gcSample, 
+                     fun="enrichGO",
+                     ont ="BP", 
+                     keyType = "SYMBOL", 
+                     OrgDb = "org.Hs.eg.db")
+
+library(DOSE)
+library(enrichplot)
+edo <- pairwise_termsim(xx)
+
+plot <- emapplot(edo, showCategory=50, cex_category=0.01, pie="Count", cex_line = 0.3, layout="graphopt", min_edge=0.15, repel=T)
+plot
+
+dotplot(edo, showCategory=3)+theme_classic()+scale_colour_gradientn(colors ="black")
+
+
+
+res_map <- 
+  edo@compareClusterResult %>% 
+  filter(Description %in% plot$data$name) %>% 
+  group_by(Description, Cluster) %>% 
+  summarise(p = mean(p.adjust)) %>% 
+  ungroup() 
+
+anno <- data.frame(name=unique(res_map$Description), type=map(.x=unique(res_map$Description), .f=function(i){
+  
+  
+  c <- res_map %>% filter(Description==i) %>% pull(Cluster)
+  return(c[res_map %>% filter(Description==i) %>% pull(p) %>% which.min()] %>% as.character())
+}) %>% unlist())
+anno$type <- factor(anno$type, levels =names(gcSample) )
+plot$data <- plot$data %>% dplyr::left_join(., anno, by="name")
+
+col.test <- gplots::col2hex(unique(plot$data$type))
+names(col.test) <- unique(plot$data$type)
+
+ggplot(data=plot$data)+
+  plot$layers[[1]]+
+  geom_point(mapping = aes(x=x, y=y, size=size, color=type))+ # %>% scales::muted()+
+  theme_classic()+
+  scale_color_manual(values = col.test)
+
+
+
+### Bring Scores to spatial data 
+
+
+gs <- map_dfr(.x=1:length(gcSample), .f=function(i){
+  data.frame(ont=names(gcSample)[i], gene=gcSample[[i]])
+}) 
+for(i in 1:length(list.obj)){list.obj[[i]]@used_genesets <- rbind(list.obj[[i]]@used_genesets, gs)}
+
+unique(gs$ont)
+col <- colorRampPalette(rev(RColorBrewer::brewer.pal(9,"Spectral")))
+col <- colorRampPalette(viridis::turbo(50))
+
+
+expression_plot(list.obj[[1]], gene="tan")
+
+
+
+expression_plot <- function(obj, gene, col="Reds"){
+  obj <- SPATA2::updateSpataObject(obj)
+  hull <-   
+    getCoordsDf(obj) %>% 
+    ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+  
+  df <- SPATA2::joinWith(obj, genes=gene, normalize = T, smooth = F)
+  names(df)[7] <- "gene"
+  
+  obj@information$active_mtr <- "denoised"
+  p1 <- SPATA2::plotSurface2(df, 
+                             color_by = "gene", 
+                             alpha_by = "gene",
+                             pt_clrsp=col,
+                             limits=c(0.4,0.8),
+                             oob=scales::squish)+
+    hull+
+    SPATA2::ggpLayerAxesSI(obj)+
+    ggtitle(gene)
+  return(p1)
+}
+feature_plot <- function(obj, feature){
+  
+  hull <-   
+    getCoordsDf(obj) %>% 
+    ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+  
+  p1 <- SPATA2::plotSurface(obj, 
+                            color_by = feature, 
+                            display_image = F)+
+    hull+
+    SPATA2::ggpLayerAxesSI(obj)+
+    ggtitle(feature)
+  return(p1)
+}
+Module_plot <- function(obj, module, gcSample, limits=c(0,1), smooth=T){
+  
+  hull <-   
+    getCoordsDf(obj) %>% 
+    ggforce::geom_mark_hull(mapping = ggplot2::aes(x = x, y = y), alpha = 1, color = "black", size = 2, expand = unit(1, "mm"))
+  
+  genes <- gcSample[[module]]
+  df <- SPATA2::joinWith(obj, genes=genes, normalize = T, smooth = smooth, average_genes = T)
+  names(df)[7] <- "gene"
+  
+  obj@information$active_mtr <- "denoised"
+  
+  col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex(module)))
+  
+  
+  p1 <- SPATA2::plotSurface2(df, 
+                             color_by = "gene", 
+                             alpha_by = "gene",
+                             limits=limits,
+                             oob=scales::squish)+
+    hull+
+    SPATA2::ggpLayerAxesSI(obj)+
+    ggtitle(module)+
+    scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=limits)
+  return(p1)
+}
+
+Module_plot(list.obj[[1]], module="tan", gcSample, limits=c(0.3,0.7))
+
+
+SPATAwrappers::plotColorOverlap(list.obj[[2]], 
+                                feature1 = "greenyellow", 
+                                feature2="CD68",
+                                col.threshold=0.1)
+
+
+SPATAwrappers::runSpatialRegression(list.obj[[1]], 
+                                    features = c("greenyellow", "CD68", "CD19", "CD8A"),
+                                    model="lmSLX")
+
+
+# save Data 
+HPNST <- list(list.obj, seurat_obj)
+saveRDS(HPNST.res, "HPNST_alone.RDS")
+
+
+
+
+## Check myeloid and T/B cell content in primary Neurofibroma
+all_fibroma <- readRDS("~/Desktop/Aachen_NP/Manuscript/Analysis_WGCNA_Fibroma/HPNST+Neurofibroma.res.RDS")
+
+list.obj <- all_fibroma[[1]]
+
+
+
+plotSurface(list.obj[[3]], color_by = "Histologie")
+
+list.obj[[3]]@information$active_mtr="scaled"
+
+expression_plot(list.obj[[3]], gene = "CD68", col = "Grays", limits = c(0.2,1))
+expression_plot(list.obj[[3]], gene = "CD163", col = "Grays", limits = c(0.2,1))
+
+expression_plot(list.obj[[3]], gene = "CD19", col = "Grays", limits = c(0.15,0.8))
+expression_plot(list.obj[[3]], gene = "CD3D", col = "Grays", limits = c(0.8,1))
+expression_plot(list.obj[[3]], gene = "AIF1", col = "Grays", limits = c(0.3,1))
+
+
+expression_plot(list.obj[[3]], gene = "CD79A", col = "Grays", limits = c(0.1,0.8))
+expression_plot(list.obj[[3]], gene = "IGHM", col = "Grays", limits = c(0.1,0.8))
+
+```
+
+# Published Data Analysis:
+## Step 1: Seurat Analysis
+```{r}
+#Load sample list
+samples <- all_data
+samples <- samples %>% filter(Diagnosis %in% c("HPNST", "Neurofibrom"))
+samples <- samples[c(1:4,6,8),]
+
+seurat_all <- map(1:nrow(samples), function(i){
+  obj <- readRDS(samples$path[i])
+  mat <- obj %>% SPATA2::getCountMatrix()
+  seurat <- Seurat::CreateSeuratObject(mat)
+  
+  if(i<=4){
+    features <- getFeatureDf(obj) %>% select("barcodes", "Histologie", "BayesSpace") %>% as.data.frame()
+    rownames(features) <- features$barcodes
+    seurat <- Seurat::AddMetaData(seurat,features)
+  }else{
+    features <- getFeatureDf(obj) %>% select("barcodes", "Histology", "seurat_clusters") %>% as.data.frame()
+    names(features) <- c("barcodes", "Histologie", "BayesSpace")
+    rownames(features) <- features$barcodes
+    seurat <- Seurat::AddMetaData(seurat,features)
+  }
+  
+  return(seurat)
+})
+seurat_all <- map(1:nrow(samples), .f=function(.x){
+  seurat_all[[.x]]@meta.data$sample = samples$samples[.x]
+  return(seurat_all[[.x]])})
+
+seurat <- seurat_all[[1]]
+for(i in 2:length(samples$samples)){seurat <- merge(seurat, seurat_all[[i]])}
+seurat <- JoinLayers(seurat)
+seurat_all <- seurat
+seurat_all <- Seurat::DietSeurat(seurat_all)
+
+seurat_all <- 
+  seurat_all %>%
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunPCA()
+## Remove spots without expression
+seurat_all <- subset(seurat_all, subset=nCount_RNA>300)
+Seurat::VlnPlot(seurat_all, features="nCount_RNA" )
+seurat_all$tech <- "home" 
+seurat_all$tech[str_detect(seurat_all$sample, "NF")] <- "Ex"
+table(seurat_all$tech)
+
+seurat_all <- harmony::RunHarmony(seurat_all, group.by.vars=c("sample", "tech"))
+seurat_all <- 
+  seurat_all %>% 
+  Seurat::RunUMAP(dims=1:20, reduction = "harmony")
+
+DimPlot(seurat_all, group.by = c("sample"), label = T, raster = T)
+DimPlot(seurat_all, group.by = c("Histologie"), label = T, raster = T)
+
+seurat_all$Histologie[seurat_all$Histologie=="unnamed"]="Stroma"
+seurat_all$Histologie[seurat_all$Histologie=="Neurofibrom"]="Neurofibroma"
+seurat_all$Histologie[seurat_all$Histologie=="Tumor"]="Neurofibroma"
+
+```
+
+## Merge Objects by cluster
+```{r}
+
+
+seurat_all$BayesSpace_ALL <- paste0(seurat_all$BayesSpace,"_",seurat_all$sample)
+
+
+matrix <- seurat_all@assays$RNA@layers$counts %>% t() %>%  as.data.frame()
+colnames(matrix) <- seurat_all@assays$RNA@features@.Data %>% rownames()
+rownames(matrix) <- seurat_all@assays$RNA@cells@.Data %>% rownames()
+matrix$select <- seurat_all$BayesSpace_ALL
+matrix <- matrix %>% group_by(select) %>% summarise_all(.fun=sum)
+matrix[1:10, 1:10]
+samples_sub <- matrix$select
+
+matrix <- matrix[2:ncol(matrix)] %>% as.matrix()
+rownames(matrix) <- samples_sub
+seurat_sub <- Seurat::CreateSeuratObject(counts = matrix %>% t())
+
+seurat_sub <- 
+    seurat_sub %>%
+    NormalizeData() %>%
+    FindVariableFeatures() %>%
+    ScaleData() %>% 
+    SCTransform(return.only.var.genes = F)
+
+
+```
+
+## Heatmap of merged objects
+```{r}
+comb <- seurat_sub
+merge <- comb@assays$SCT@scale.data %>% cor()
+
+samples$ID <- c("Aachen1", "Aachen4", "Aachen7", "Aachen8", "NF_extern1", "NF_extern2")
+
+anno.row <-
+  comb@meta.data %>% 
+  as.data.frame() %>% 
+  rownames_to_column("ss") %>% 
+  mutate(samples = str_split(ss, "_") %>% 
+           map( .f=function(.x){
+             if(length(.x)==3){
+               paste0(.x[[2]],"_",.x[[3]])}
+               else{.x[[2]]}
+               })%>% unlist()) %>% 
+  left_join(., samples %>% select(samples, Diagnosis)) %>% 
+  select(ss,samples, Diagnosis)
+
+rownames(anno.row) <- anno.row$ss
+anno.row <- anno.row[,c(2:3)]
+
+pheatmap::pheatmap(merge, annotation_col = anno.row,  color = RColorBrewer::brewer.pal(9,"RdPu"))
+
+```
+
+## Find Significant DE
+```{r}
+
+Seurat::Idents(seurat_all) <- "Histologie"
+dea_df <- Seurat::FindAllMarkers(seurat_all)
+dea_df %>% filter(avg_log2FC>0.2) %>% filter(p_val<0.01) %>%  group_by(cluster) %>% count()
+
+plotDeaVolcanoDEA2 <- function(dea_df, x1="Neurofibroma", x2="Schwannoma"){
+  
+  left <- dea_df %>% filter(cluster==x1) %>% filter(avg_log2FC > 0)
+  right <- dea_df %>% filter(cluster==x2) %>% filter(avg_log2FC > 0) %>% mutate(avg_log2FC=-avg_log2FC)
+  
+  plot_df <- rbind(left, right)
+
+  top <- dea_df %>% group_by(cluster) %>% top_n(., n=10, wt=avg_log2FC) %>% ungroup() %>% filter(cluster %in% c(x1,x2))
+  top <- plot_df %>% filter(gene %in% top$gene)
+  
+  
+  ggplot()+
+    geom_point(data=plot_df, mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="grey")+
+    geom_point(data=plot_df %>% filter(cluster==x1) %>% filter(p_val_adj<0.001) , mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="tomato")+
+    geom_point(data=plot_df %>% filter(cluster==x2) %>% filter(p_val_adj<0.001) , mapping=aes(x=avg_log2FC, y=-log(p_val_adj)), color="steelblue")+
+    ggrepel::geom_text_repel(data = top, mapping = ggplot2::aes(x=avg_log2FC, y=-log(p_val_adj), label = .data[["gene"]]), size = 5)+
+    theme_classic()
+    #xlim(-2,3)
+  
+  
+}
+plotDeaVolcanoDEA2(dea_df)
+
+## Plot genes
+obj1 <- readRDS(all_data$path[1]) %>% SPATA2::updateSpataObject()
+
+obj2 <- readRDS(all_data$path[10])%>% SPATA2::updateSpataObject()
+obj3 <- readRDS(all_data$path[12])%>% SPATA2::updateSpataObject()
+
+SPATA2::plotSurface(obj2, color_by="APOD", pt_alpha=0)
+
+col2 <- colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+SPATA2::plotSurface(obj2, color_by="APOD", alpha_by= "APOD")+
+    scale_color_gradientn(colours = col2(50),
+                        limit=c(0.5,1), 
+                        oob = scales::squish, na.value = "white",name="")+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  scale_alpha(limit=c(0.5,1), oob=scales::squish)+
+  theme_bw() +
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))
+  #SPATA2::ggpLayerAxesSI(obj2, breaks = str_c(1:12, "mm"))
+
+obj2 <- scVI_expression(obj2)
+obj3 <- scVI_expression(obj3)
+
+getExpressionMatrixNames(obj2)
+obj2 <- SPATA2::setActiveExpressionMatrix(obj2, "scVI")
+
+
+gene="LAMA2"
+p=SPATA2::plotSurface(obj2, color_by=gene, alpha_by= gene, display_image=F)
+ 
+ggplot(p$data)+
+  #geom_point(mapping=aes(x=x, y=y),size=6, color="black")+
+  #geom_point(mapping=aes(x=x, y=y),size=4, color="white")+
+  p$layers[[1]]+
+scale_color_gradientn(colours = col2(50),
+                        limit=c(0.,0.8), 
+                        oob = scales::squish, na.value = "white",name="")+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  scale_alpha(
+    limit=c(0.,0.8), 
+              oob=scales::squish)+
+  theme_bw() +
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))
+
+
+gene="PRRX1"
+obj1 <- setActiveExpressionMatrix(obj2, "denoised")
+SPATA2::plotSurface(obj3, color_by=gene, alpha_by= gene)+
+    scale_color_gradientn(colours = col2(50),
+                        limit=c(0.,0.4), 
+                        oob = scales::squish, na.value = "white",name="")+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  scale_alpha(
+    #limit=c(0.,0.8), 
+              oob=scales::squish)+
+  theme_bw() +
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))
+
+
+```
+
+## Check the modules
+```{r}
+
+res <- readRDS("/.../Analysis/HPNST.res.RDS")
+
+
+pre_analysis <- res[[2]]
+pre_analysis@misc$vis$wgcna_modules %>% arrange(desc(kME_greenyellow)) %>% head(10) %>% rownames()
+
+kME <- pre_analysis@misc$vis$wgcna_modules 
+gcSample <- map(.x=unique(kME$color), .f=function(i){
+  
+  kME %>% filter(color==i) %>% arrange(desc(!!sym(paste0("kME_",i)))) %>% head(300) %>% rownames()
+  
+  
+})
+names(gcSample) <- unique(kME$color)
+
+Module_GS <- map_dfr(1:length(gcSample), .f=function(i){
+  data.frame(ont=names(gcSample)[i], gene=gcSample[[i]])
+})
+
+obj2@used_genesets <- rbind(obj2@used_genesets, Module_GS)
+obj1@used_genesets <- rbind(obj2@used_genesets, Module_GS)
+
+gene="greenyellow"
+obj1 <- setActiveExpressionMatrix(obj1, "denoised")
+SPATA2::plotSurface(obj3, color_by=gene, alpha_by= gene)+
+    scale_color_gradientn(colours = col2(50),
+                        limit=c(0.,0.7), 
+                        oob = scales::squish, na.value = "white",name="")+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  scale_alpha(
+    #limit=c(0.,0.8), 
+              oob=scales::squish)+
+  theme_bw() +
+  theme(plot.margin = margin(1.5,1.5,1.5,1.5, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))
+
+
+df <- SPATA2::joinWith(obj1, gene_sets =gene, normalize = T, smooth = F)
+names(df)[9] <- "gene"
+
+col <- colorRampPalette(viridis::turbo(50))(50)
+p1 <- SPATA2::plotSurface(df, 
+                          color_by = "gene", 
+                          alpha_by = "gene",
+                          limits=c(0.4,0.8),
+                          oob=scales::squish)
+
+modul=gcSample$greenyellow[1:12]
+modul <- c("ABI3BP", "LMO3", "SMOC2", "FLT3", "LSP1", "MSTN", "FMO3", "GRIA1", "MMP2", "GNA14", "SEPT11", "COL1A2")
+obj3 <- setActiveExpressionMatrix(obj3, "scVI")
+col <- colorRampPalette(color = c("#EDEDED",  gplots::col2hex("greenyellow")))
+obj3 %>% plotSurfaceComparison(., color_by = modul, smooth = F, display_image = F)+
+  scale_colour_gradientn(colours = col(50), oob = scales::squish, limits=c(0.25, 0.6))+
+  theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+  )
+
+obj3 <- setActiveExpressionMatrix(obj3, "scaled")
+getExpressionMatrix(obj3) %>% dim()
+
+
+```
+
+## WGCNA
+```{r}
+library(WGCNA)
+library(hdWGCNA)
+library(igraph)
+library(patchwork)
+
+seurat_obj$Diagnosis <- anno.row$Diagnosis
+
+seurat_obj <- 
+  hdWGCNA::SetupForWGCNA(comb, gene_select = "fraction",fraction = 0.05,wgcna_name = "vis") %>% 
+  hdWGCNA::SetDatExpr(assay="RNA") %>% 
+  hdWGCNA::TestSoftPowers()
+
+#Check Network Con
+wrap_plots(hdWGCNA::PlotSoftPowers(seurat_obj), ncol=2)
+
+#Get Network
+seurat_obj <- hdWGCNA::ConstructNetwork(seurat_obj,soft_power=7,tom_name='test',overwrite_tom=TRUE)
+
+# plot the dendrogram
+hdWGCNA::PlotDendrogram(seurat_obj, main='WGCNA dendrogram')
+seurat_obj <- hdWGCNA::ModuleEigengenes(seurat_obj, assay = "RNA",npcs = 10)
+seurat_obj <- hdWGCNA::ModuleConnectivity(seurat_obj)
+
+#HubGeneNetworkPlot(seurat_obj,n_hubs = 10, n_other=20, edge_prop = 0.25,mods = 'all', vertex.label=NA)
+
+seurat_obj <- RunModuleUMAP(
+  seurat_obj,
+  n_hubs = 5,
+  n_neighbors=5,
+  min_dist=0.1,
+  spread=2,
+  wgcna_name = 'vis',
+  target_weight=0.05,
+  supervised=TRUE
+)
+
+p=ModuleUMAPPlot(
+  seurat_obj,
+  edge.alpha=0.25,
+  sample_edges=TRUE,
+  edge_prop=0.2, 
+  label_hubs=2,
+  return_graph=T,
+  keep_grey_edges=FALSE)
+
+library(igraph)
+library(scattermore)
+library(ggrepel)
+
+
+seurat_obj@misc$vis$MEs[ ] %>% pheatmap::pheatmap( cluster_rows = T)
+plotdf <- seurat_obj@misc$vis$module_umap %>% filter(color!="grey60")
+plotdf2 <- as_long_data_frame(p)
+plotdf2 <- plotdf2 %>% filter(from_name %in% plotdf$gene)
+
+# Create Plot of Expression Network
+plot_p <- ggplot()+theme_void()+coord_fixed()
+dat1 <- plotdf2 %>% filter(from_kME>0.5)
+plot_p <- plot_p+geom_segment(data=dat1, mapping = aes(x=from_UMAP1, y=from_UMAP2, xend=to_UMAP1, yend=to_UMAP2), size=dat1$from_kME*0.1, alpha=dat1$from_kME*0.1)
+plot_p <- plot_p+geom_scattermore(data=plotdf, mapping=aes(x=UMAP1, y=UMAP2),size=plotdf$kME*2, alpha=0.1, color=gplots::col2hex(plotdf$color), pointsize=3)
+plot_p <- plot_p+theme_void()+geom_text_repel(data=plotdf %>% group_by(module) %>% summarise(UMAP1=mean(UMAP1), UMAP2=mean(UMAP2)), mapping=aes(x=UMAP1, y=UMAP2,label=module))
+plot_p <- plot_p+geom_text_repel(data=plotdf %>% group_by(module) %>% top_n(., 10, wt=kME), mapping=aes(x=UMAP1, y=UMAP2,label=gene))
+plot_p
+
+
+## DE Analysis
+ModuleCorrelogram(seurat_obj)
+
+DMEs_all <- FindAllDMEs(
+  seurat_obj,
+  group.by = 'Diagnosis',
+  wgcna_name = 'vis'
+)
+
+head(DMEs_all)
+
+sig.modules <- 
+  DMEs_all %>% 
+  filter(avg_log2FC>1 & !is.infinite(avg_log2FC)) %>% 
+  group_by(group) %>% 
+  top_n(., 50, wt=-log(p_val)) %>% 
+  arrange(desc(avg_log2FC), .by_group = T) %>% 
+  ungroup() %>% 
+  mutate(module=as.factor(module))
+col <- gplots::col2hex(sig.modules$module)
+names(col) <- sig.modules$module
+sig.modules$module <- factor(sig.modules$module, levels = sig.modules$module)
+
+#barplot
+ggplot(sig.modules, aes(fill=module, y=avg_log2FC, x=group)) + 
+  geom_bar(stat="identity",position=position_dodge())+
+  theme_classic()+
+  scale_fill_manual(values=col)
+
+```
+
+
+
+
+## Plot Enrich db
+
+```{r}
+library(readxl)
+enrichr_df <- read_excel("~/.../GeneSetEnrichment_HPNST_alone.xlsx")
+enrichr_df <- read_excel("GeneSetEnrichment_Fig1.xlsx")
+
+enrichr_df$color <- enrichr_df$module
+database = c("GO_Biological_Process_2021","GO_Cellular_Component_2021","GO_Molecular_Function_2021")
+mods = unique(enrichr_df$module)
+modules = unique(enrichr_df$module)
+n_terms = 5
+break_ties = TRUE
+logscale = TRUE
+wgcna_name = NULL
+
+wrapText <- function(x, len) {
+    sapply(x, function(y) paste(strwrap(y, len), collapse = "\n"), 
+           USE.NAMES = FALSE)
+  }
+  
+plot_df <- enrichr_df %>% 
+  subset(db == database & module %in% mods) %>% 
+  group_by(module) %>% 
+  top_n(n_terms, wt = Combined.Score)
+
+if (break_ties) {plot_df <- do.call(rbind, lapply(plot_df %>% group_by(module) %>% 
+                                                    group_split, function(x) {
+                                                      x[sample(n_terms), ]}))}
+
+
+  
+plot_df$Term <- plot_df$Term %>% str_replace_all(., "-", " ")
+#plot_df$module <- factor(as.character(plot_df$module), levels = levels(modules))
+plot_df <- arrange(plot_df, module)
+plot_df$Term <- factor(as.character(plot_df$Term), levels = unique(as.character(plot_df$Term)))
+plot_df$Combined.Score <- log(plot_df$Combined.Score)
+    lab <- "Enrichment\nlog(combined score)"
+    x <- 0.2
+p <- 
+  plot_df %>% 
+  ggplot(aes(x = module, y = Term)) + geom_point(aes(size = Combined.Score, color = Combined.Score)) + 
+  #RotatedAxis() + 
+  ylab("") + 
+  xlab("") + 
+  labs(size = lab) + scale_y_discrete(limits = rev) + ggtitle(database) + 
+    theme(plot.title = element_text(hjust = 0.5), axis.line.x = element_blank(), 
+          axis.line.y = element_blank(), panel.border = element_rect(colour = "black", 
+                                                                     fill = NA, size = 1))
+p+
+  theme_classic()+
+  scale_colour_gradientn(colors =colorRampPalette(rev(RColorBrewer::brewer.pal(9,"BrBG")))(50))
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
